@@ -1,0 +1,18 @@
+# terraform
+*.tfstate*
+.terraform/
+crash.log
+
+# databricks
+.databricks/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# local
+.env
+.DS_Store

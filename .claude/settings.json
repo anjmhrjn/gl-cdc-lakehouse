@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "ask": [
+      "Bash(terraform apply:*)",
+      "Bash(databricks bundle deploy:*)",
+      "Bash(databricks bundle run:*)",
+      "Bash(aws s3 rm:*)"
+    ],
+    "deny": [
+      "Bash(terraform destroy:*)",
+      "Bash(databricks bundle destroy:*)",
+      "Read(~/.aws/**)",
+      "Read(~/.databrickscfg)",
+      "Read(./**/*.tfstate)",
+      "Read(./**/*.tfstate.backup)",
+      "Read(./.env)"
+    ]
+  }
+}
