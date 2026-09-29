@@ -465,3 +465,200 @@ Quarantine reasons: accounts `currency_known` 1; journal_entries `amount_positiv
   timestamps. Both runs used seed 42 on the same day, so they produced the same amounts
   on the same accounts and dates. That fits the id fix: only ids changed between the
   runs, and gold does not see ids.
+
+## Checkpoint 4: Governance
+
+### Where each piece lives
+
+| Piece | Where | Applied by |
+|---|---|---|
+| Catalog and schema grants | `infra/terraform/unity_catalog.tf` | Terraform |
+| Mask and filter functions | `sql/governance/01_functions.sql` | `governance` job |
+| Classification and pii tags | `sql/governance/02_tags.sql` | `governance` job |
+| Masks and row filters | `sql/governance/03_masks_filters.sql` | `governance` job |
+| EXECUTE on the functions | `sql/governance/04_grants.sql` | `governance` job |
+
+The job is a serverless Python task that runs the files in name order through
+`spark.sql`, so no SQL warehouse is needed. The files never name a catalog. The job
+runs `USE CATALOG gl_<env>` first, so one set of files serves dev and prod.
+
+Pipeline tables take `ALTER STREAMING TABLE` or `ALTER MATERIALIZED VIEW`. `ALTER TABLE`
+is not supported on them. Bronze and silver are streaming tables and gold is two
+materialized views.
+
+### Masks and filters are attached by ALTER, not in the pipeline
+
+They could also be declared in the pipeline code, with `row_filter=` and `MASK` in each
+table's schema. Using `ALTER` keeps all governance in one directory, which is what
+CLAUDE.md asks for. It also spares writing out a full schema for every AUTO CDC
+target. This works because of a change in pipelines release 2025.29: pipeline updates
+now keep masks and filters set with `ALTER`. Before that, each update removed them.
+
+The cost: when the pipeline creates a table, the table is unprotected until the
+governance job runs. On dev that window is accepted. The `backfill_replay` job in
+checkpoint 5 runs governance after any full refresh. It is still unconfirmed whether a
+full refresh keeps `ALTER`-set masks. That run will show it, and `governance_check`
+fails if they are gone.
+
+### The pipeline owner must be in gl_pii_readers and gl_engineers
+
+When a pipeline update refreshes a table, the mask and filter functions on the tables
+it **reads** run with the pipeline owner's rights. When a person queries a table, they
+run as that person. So the pipeline sees what its owner would see:
+
+- Silver reads `bronze.accounts_cdc_raw`, which has masks on `before` and `after`. If
+  the owner were not in `gl_pii_readers`, silver would be built from `REDACTED` and
+  `********9012`, and the real values would be gone from silver.
+- Gold reads `silver.account_history`, which has the row filter. If the owner were not
+  in `gl_engineers`, gold would silently lose every unit the owner cannot see.
+
+Both memberships were confirmed for the owner on 2026-09-29. `silver_state_check` runs
+as the same identity, so it still compares full, unmasked values.
+
+### Raw layers are masked too
+
+The data contract names three PII columns, but the same values also sit in:
+
+- `bronze.accounts_cdc_raw.before` and `.after` (the row structs)
+- `_corrupt_record` and `_rescued_data` (raw text)
+- `silver.quarantine_events.payload` (the event as JSON)
+
+Analysts cannot reach bronze or silver. But without masks there, an engineer outside
+`gl_pii_readers` could read every holder's email from bronze, and the silver masks
+would protect nothing. So those columns carry `pii = true` and a mask as well:
+
+- The struct mask returns the same struct type with the three PII fields masked.
+  Unity Catalog requires a mask to return the column's exact type.
+- `mask_payload` takes `source_table` as a second argument (`USING COLUMNS`). Only
+  account payloads are redacted, so journal quarantine stays readable for debugging.
+
+### Function design
+
+- **`is_account_group_member`, not `is_member`.** The groups are account-level.
+  `is_member` only checks workspace-local groups.
+- **No function calls another UDF.** `mask_account_row` repeats the last-four rule
+  instead of calling `mask_account_number`. The docs list "nesting" among the policy
+  features that MERGE does not support, without saying exactly what counts. AUTO CDC
+  writes silver with MERGE, so the functions stay flat. The first pipeline update after
+  the governance job shows whether AUTO CDC can still write to the masked and filtered
+  silver tables.
+- **NULL stays NULL for everyone.** A missing value is not PII, and hiding it would
+  hide data quality problems from engineers.
+- **An account number of four characters or fewer is masked completely.** Otherwise
+  its last four would be the whole value.
+- **Rows with a NULL business_unit are visible to engineers only.** These are journal
+  lines whose account has not landed. No analyst unit can claim them until it does.
+- **`silver.journal_entries` has no row filter.** It has no business_unit column, and
+  analysts have no silver access.
+
+The unit tests run the real `01_functions.sql` on local Spark. Each function is created
+as a temporary function beside a stub `is_account_group_member` that answers from a
+fixed list of groups, so the tests exercise the SQL itself rather than a Python copy.
+
+### Function ownership
+
+Terraform gives the catalogs and schemas to `gl_engineers`. The functions are owned by
+whoever first ran the governance job, because the SQL reference documents no
+`ALTER FUNCTION ... OWNER TO` statement. `04_grants.sql` grants `EXECUTE` to
+`gl_engineers` instead, so any engineer can attach the functions. Replacing a function
+still needs its owner. If the maintainer changes, the owner is changed once in Catalog
+Explorer.
+
+### Pipeline backing tables
+
+The pipeline keeps internal tables in the same schemas as the tables it publishes:
+
+- a `__materialization_mat_<pipeline id>_<table>_1` table behind each streaming table
+  and materialized view
+- an `event_log_<pipeline id>` table in silver
+
+They are hidden in Catalog Explorer but listed in `information_schema.tables`. The
+backing tables hold the real data, unmasked and unfiltered: the one behind
+`silver.accounts` has all three PII columns and no masks. The first `governance_check`
+run found them, because it requires a classification tag on every silver and gold table.
+
+Schema grants do not reach these tables. On dev on 2026-09-29, the Unity Catalog
+effective permissions API returned:
+
+| Principal | Table | Effective privileges |
+|---|---|---|
+| gl_analysts_treasury | gold.daily_trial_balance | SELECT, inherited from gl_dev.gold |
+| gl_analysts_treasury | its gold backing table | none |
+| gl_engineers | the silver accounts backing table | none |
+| both groups | the event log | none |
+
+So they are left untagged and unmasked, and `governance_check` skips them by name. The
+toggle test confirmed it with real queries: as the test user, direct reads of two
+backing tables failed with a permission error at every group step.
+
+### Classification
+
+| Classification | Tables | Why |
+|---|---|---|
+| confidential | bronze (both), silver accounts, account_history, quarantine_events | hold PII or raw events |
+| confidential | silver journal_entries | the ledger at line level |
+| internal | gold account_balances, daily_trial_balance | aggregates, no PII, filtered by unit |
+
+### Verification
+
+- `governance_check` reads `information_schema` and fails if any of the following is
+  missing: a classification tag on a silver or gold table, a pii tag, a mask, or a row
+  filter. It also fails if anyone holds `ALL PRIVILEGES` on the catalog or a schema.
+- It shows what is attached, not what anyone sees. For that, a test user is moved
+  through the groups and runs `tests/integration/governance_toggle.sql` at each step.
+
+### Verified on dev
+
+Run on 2026-09-29, in this order:
+
+1. The `governance` job applied every file.
+2. The first `governance_check` found the pipeline's internal tables in silver and gold
+   (see "Pipeline backing tables"). After the check was changed to skip them, it passed:
+   8 classifications, 11 masks with pii tags, 4 row filters, no `ALL PRIVILEGES`.
+3. A generator run (448 journal events) and a pipeline update. AUTO CDC wrote to all
+   three silver tables with the masks and row filter in place, and both gold views
+   refreshed. The MERGE restriction did not apply to these flat functions.
+4. `governance_check` passed again: the masks and filters survived the update.
+5. `silver_state_check` matched on every table, 0 missing and 0 extra:
+
+   | Table | Rows |
+   |---|---|
+   | silver.accounts | 206 |
+   | silver.account_history | 558 |
+   | silver.journal_entries | 823 |
+   | silver.quarantine_events | 7 |
+   | gold.account_balances | 153 |
+   | gold.daily_trial_balance | 32 |
+
+   The reference is computed from the landing files, PII columns included. A match
+   means the pipeline read bronze unmasked, as its owner, and silver holds real values.
+6. `governance` ran a second time, and `governance_check` still passed.
+
+### Verified by group membership
+
+A test user went through the groups one step at a time and ran
+`tests/integration/governance_toggle.sql` at each step, on 2026-09-29, against the data
+from the run above.
+
+| Test user's groups | Gold units visible | trial balance rows / lines | account_balances rows | Silver and bronze PII |
+|---|---|---|---|---|
+| none | no access | - | - | no access |
+| gl_analysts_treasury | TREASURY | 9 / 160 | 50 | no access |
+| + gl_engineers | all three | 32 / 823 | 153 | masked |
+| + gl_pii_readers | all three | 32 / 823 | 153 | clear |
+
+- **Row filter.** The treasury analyst saw TREASURY only. With `gl_engineers` added,
+  the totals equal the `silver_state_check` counts (32 and 153 rows), so the filter
+  hides nothing from engineers. `account_history` showed 558 versions across the three
+  units, the same as the state check.
+- **Masks.** As an engineer: account numbers showed as `********4295`, names and emails
+  as `REDACTED`, in both silver and the bronze row structs. Account quarantine payloads
+  were `REDACTED`, while journal payloads stayed readable. Adding `gl_pii_readers`
+  showed every value in clear, and the last four digits matched.
+- **No privilege on `bu_filter` is needed.** The analyst queried gold with only the
+  Terraform grants. The docs did not say this, and the test settles it.
+- **Backing tables are unreadable.** Direct queries on the gold `daily_trial_balance` and
+  silver `accounts` backing tables failed with a permission error at every step. That
+  confirms what the effective permissions API reported.
+
+Still to do: a full refresh, in checkpoint 5, to see whether `ALTER`-set masks survive it.

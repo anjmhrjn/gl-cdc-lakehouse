@@ -32,7 +32,7 @@ testpaths = ["tests/unit"]
 pythonpath = [".", "src", "tests/unit"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["generator", "transforms", "conftest"]
+known-first-party = ["generator", "jobs", "transforms", "conftest"]
 
 [tool.ruff.lint.per-file-ignores]
 # The pipeline runtime injects `spark` as a global into pipeline source files.

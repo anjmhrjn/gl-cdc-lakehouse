@@ -125,3 +125,40 @@ reconciliation passed because it starts from an empty directory.
 
 **Fix:** the reconciliation proof runs on an empty dev landing prefix. ARCHITECTURE.md
 now states that the late accounts are only late on an empty prefix.
+
+## Wrong information_schema column names in governance_check
+
+**Produced:** `tests/integration/governance_check.py` queried `column_masks` for
+`schema_name`, `mask_schema` and `mask_name`, and `row_filters` for `schema_name`,
+`filter_schema`, `filter_name` and `filter_col_usage`.
+
+**Wrong:** I took the column names from a summarized version of the docs pages and did
+not check them against the workspace. CLAUDE.md says to verify APIs and never guess
+parameters. A summary of a docs page is not verification. The real views use
+`table_catalog`, `table_schema` and `table_name`, and neither one has a column for the
+function's schema. `column_masks` has `column_name` and `mask_name`. `row_filters` has
+`filter_name` and `target_columns`.
+
+**Caught by:** Anuj's first `governance_check` run on dev:
+`[UNRESOLVED_COLUMN.WITH_SUGGESTION] ... schema_name cannot be resolved. Did you mean
+... table_schema ...`. The error's list of candidates gave the `column_masks` columns.
+`DESCRIBE gl_dev.information_schema.row_filters`, run by Anuj, gave the `row_filters`
+ones.
+
+**Fix:** the queries use the column names from the workspace. The function names are
+compared whether they come back bare, schema qualified or fully qualified, because it
+is not yet known which form the views return. On a mismatch the check prints the actual
+value.
+
+**Second failure, same check:** after the column fix, the check failed on 7 tables it
+was never meant to see. It required a classification tag on every table in silver and
+gold, on the assumption that those schemas hold only the published tables. They also
+hold the pipeline's `__materialization_mat_*` backing tables and its `event_log_*`
+table. The effective permissions API showed that no group has any privilege on them, so
+the check now skips them by name. ARCHITECTURE.md records the evidence. The toggle test
+also reads two of them directly as the test user.
+
+**Also in this checkpoint:** my first version of `04_grants.sql` used
+`ALTER FUNCTION ... OWNER TO`, which I could not find in the SQL reference when I
+checked. I replaced it with `GRANT EXECUTE` before handing the files over, so no run
+caught it.
