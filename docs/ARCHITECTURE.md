@@ -105,13 +105,22 @@ arriving event therefore sits in a fresh partition while carrying an old `lsn`. 
 exactly the case bronze and silver have to handle, and partitioning by event time would
 hide it.
 
+### lsn follows wall-clock time
+
+`lsn` is the run's time in milliseconds times 100, plus a counter. Real log sequence
+numbers only grow, across runs as well as within one. The first version started every
+run at 5,000,000, so two runs landed different rows under the same (key, lsn), which no
+ordering can resolve (see `AI_USAGE.md`). Anchoring to time means a later run always
+sequences after an earlier one: a run's events use at most 64 slots each, far fewer than
+the 100 slots per millisecond between runs.
+
 ### Late arrivals get a genuinely older lsn
 
-The run's `lsn` counter starts at 5,000,000. Late events draw from the band below it,
-scaled by how far back they are dated, up to `--late-hours` (48 by default). So a late
-event is not just old by timestamp, it is old by the sequence key that silver actually
-orders on. Three accounts are also held back so their journal entries land before the
-account exists, which exercises the warn-only orphan foreign key rule.
+A late event gets the lsn a change made at its backdated time would have had, up to
+`--late-hours` (48 by default) in the past, and a matching `ts_ms`. So a late event is
+not just old by timestamp, it is old by the sequence key that silver actually orders on.
+Three accounts are also held back so their journal entries land before the account
+exists, which exercises the warn-only orphan foreign key rule.
 
 ### Journals balance within a business unit and currency
 
@@ -135,3 +144,110 @@ with the project key, so objects are encrypted without the generator needing the
 ID. Passing `ServerSideEncryption=aws:kms` without a key ID would quietly switch to the
 AWS managed `aws/s3` key instead, which is not the key the Unity Catalog role is
 granted on.
+
+## Checkpoint 2: Bronze and silver CDC
+
+### API names
+
+Pipeline code uses the current Lakeflow Python API throughout: `from pyspark import
+pipelines as dp`, `@dp.table`, `@dp.temporary_view`, `@dp.expect_all_or_drop`,
+`dp.create_streaming_table` and `dp.create_auto_cdc_flow`. Not the older `dlt` module or
+`apply_changes`.
+
+### One pipeline, fully qualified names
+
+`gl_pipeline` has `silver` as its default schema but writes every table by its full
+name, `gl_<env>.bronze.*` and `gl_<env>.silver.*`. One pipeline keeps bronze and silver
+in one update and one dependency graph. The catalog and landing path come in as pipeline
+configuration (`gl.catalog`, `gl.landing_root`), both derived from the bundle's `env`.
+
+`root_path` is `src/`, which the runtime puts on `sys.path`. Pipeline files therefore
+import `transforms.cdc` the same way the unit tests do (`pythonpath = ["src"]` in
+`pyproject.toml`).
+
+### Bronze stays untyped
+
+Bronze reads landing NDJSON with Auto Loader against an explicit schema where every row
+field is a string. Unparseable lines keep their text in `_corrupt_record`, and
+unexpected fields go to `_rescued_data`. Nothing is dropped or cast. A bad value can
+never fail ingest, and silver can always be rebuilt from bronze.
+
+### Silver: what goes into AUTO CDC
+
+A temporary view per source table flattens the envelope, takes the row from `after` (or
+`before` for deletes), casts with `try_cast`, drops rows that cannot be keyed or
+sequenced, and removes exact duplicates. Three flows read from those views:
+
+| Target | SCD type | Keys | Sequence | Deletes |
+|---|---|---|---|---|
+| `silver.accounts` | 1 | account_id | `_lsn` | removed |
+| `silver.account_history` | 2 | account_id | `_lsn` | close the current version |
+| `silver.journal_entries` | 1 | entry_id | `_lsn` | removed |
+
+`try_cast` matters because serverless runs with ANSI mode on, where a plain cast of a
+bad string fails the whole batch. A bad value becomes null and is left for the
+checkpoint 3 quarantine rules.
+
+The drop rules each test for NULL explicitly (`_op IS NOT NULL AND _op IN (...)`), so an
+expectation never evaluates to NULL, which is neither a clear pass nor a clear fail.
+
+### Duplicates are removed before AUTO CDC
+
+The AUTO CDC docs do not say what happens when two events share a key and a sequence
+value. Rather than depend on undocumented behaviour, the source view removes them with
+`dropDuplicatesWithinWatermark` on (key, lsn) and a one hour watermark on
+`_ingested_at`. Since lsn is unique per change, same key and lsn means the same change
+delivered twice. The generator writes duplicates into the same file, so they arrive in
+the same micro-batch, and the watermark keeps dedupe state from growing forever.
+
+### Tombstones kept for seven days
+
+When AUTO CDC applies a delete to an SCD1 table, it keeps the key as a tombstone so a
+later-arriving, older event for that key is recognised as stale. The tombstones are
+garbage collected after `pipelines.cdc.tombstoneGCThresholdInSeconds`, two days by
+default. The generator's late arrivals are up to 48 hours old, which leaves no room for
+the gap before the next scheduled run or for a backfill. After collection, a stale
+update would re-insert a deleted row. Both SCD1 tables set the threshold to seven days.
+
+### The reference state is the test oracle
+
+AUTO CDC does not run outside Databricks, so the unit tests cannot exercise it directly.
+Instead `transforms/cdc.py` holds a batch reference of what AUTO CDC should produce:
+
+- SCD1: the highest lsn per key wins, and if that event is a delete the row is gone.
+- SCD2: every non-delete event opens a version at its lsn; the next event for the same
+  key closes it.
+
+The unit tests pin the reference down on hand-made cases (out of order, duplicates,
+deletes, late arrivals, update before a late create, update after delete) and on real
+generator output. The `silver_state_check` job then runs the same reference over the
+landing files in S3, not over bronze, and compares it to the silver tables row for row
+with `exceptAll`. If AUTO CDC and the reference disagree, one of them is wrong and the
+check says which rows.
+
+The job also prints an order-independent checksum per table (sum of `xxhash64` per
+row). Running it after an update and again after a full refresh proves the rebuild is
+idempotent.
+
+In this checkpoint silver still contains rows that checkpoint 3 will quarantine (for
+example a null amount). The reference keeps them too, so the comparison holds.
+
+### Verified on dev
+
+Run on 2026-09-29 by Anuj, after clearing the old landing files. Generator:
+`--minutes 10 --rate 50`, default seed 42. Steps: deploy, generate, pipeline update,
+`silver_state_check`, full refresh, `silver_state_check` again.
+
+| Table | Rows | Missing | Extra | Checksum |
+|---|---|---|---|---|
+| accounts | 204 | 0 | 0 | 91396765124063505071 |
+| account_history | 280 | 0 | 0 | -125919159872533020634 |
+| journal_entries | 410 | 0 | 0 | -198654095462340390530 |
+
+- AUTO CDC and the reference agree row for row on all three tables, SCD2 history
+  included.
+- The full refresh produced the same checksums, so rebuilding silver from the same
+  landing files gives identical tables.
+- Both things the docs left open held up in practice. The unparseable lines did not fail
+  the Auto Loader read, and since silver matches a reference that drops them, they did
+  not reach silver. The check job runs on serverless environment version 5.

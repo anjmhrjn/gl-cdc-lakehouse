@@ -1,0 +1,22 @@
+resources:
+  jobs:
+    silver_state_check:
+      name: silver_state_check_${var.env}
+      description: Integration test. Compares silver tables with the reference state computed from the landing files.
+      environments:
+        - environment_key: default
+          spec:
+            # Pinned rather than latest so a runtime upgrade is a deliberate change.
+            environment_version: "5"
+      tasks:
+        - task_key: compare
+          environment_key: default
+          spark_python_task:
+            python_file: ../tests/integration/silver_state_check.py
+            parameters:
+              - --catalog
+              - ${var.catalog}
+              - --landing-root
+              - ${var.landing_root}
+              - --src
+              - ${workspace.file_path}/src

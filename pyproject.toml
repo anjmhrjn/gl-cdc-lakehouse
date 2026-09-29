@@ -27,3 +27,13 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/unit"]
+# src/ is the pipeline root_path on Databricks, so modules import as `transforms.cdc` in
+# both places.
+pythonpath = [".", "src", "tests/unit"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["generator", "transforms", "conftest"]
+
+[tool.ruff.lint.per-file-ignores]
+# The pipeline runtime injects `spark` as a global into pipeline source files.
+"src/pipelines/*.py" = ["F821"]

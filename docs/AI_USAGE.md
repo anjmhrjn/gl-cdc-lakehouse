@@ -50,3 +50,23 @@ that had already been created was disturbed.
 
 **Worth noting:** the error also shows the limit of `terraform plan` as a check. Provider
 side validation of a resource that does not exist yet is not a thing plan can do.
+
+## Generator restarted lsn at the same value every run
+
+**Produced:** the checkpoint 1 generator started every run's `lsn` counter at 5,000,000
+and drew late arrivals from a fixed band below it.
+
+**Wrong:** `lsn` must be monotonic across runs, not only within one. Two runs with the
+same seed produce the same keys and the same lsns, but with different timestamps, so
+the landing prefix held different rows under the same (key, lsn). AUTO CDC cannot order
+those, and the result depends on which row it happens to see. The dev landing prefix
+already had two such runs from 2026-09-28.
+
+**Caught by:** me, while designing the checkpoint 2 integration check. Comparing silver
+to a reference only works if the input has one right answer, and this input did not. A
+script over two local runs confirmed the overlap.
+
+**Fix:** `lsn` is now the run's time in milliseconds times 100 plus a counter, and a
+late event gets the lsn of its backdated time. Two back-to-back local runs now produce
+zero conflicting (key, lsn) pairs. Anuj removed the old dev landing files before the
+first pipeline run, and silver then matched the reference exactly.

@@ -16,3 +16,6 @@ __pycache__/
 # local
 .env
 .DS_Store
+
+# local learning notes
+notes/

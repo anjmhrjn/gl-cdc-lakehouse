@@ -33,9 +33,10 @@ uv run pytest tests/unit
 
 ## Infrastructure
 
-The `gl-lakehouse` IAM user needs the policy in `infra/bootstrap/` attached before the
-first apply. It cannot grant that to itself, so it is attached once by hand as an admin.
-See `infra/bootstrap/README.md`.
+The `gl-lakehouse` IAM user needs permission to create the S3 bucket, the KMS key and
+alias, and IAM roles named `gl-cdc-lakehouse-*`, before the first apply. Terraform cannot
+grant that, because the permissions are for the identity running Terraform, so it is
+attached once by hand as an account admin.
 
 ```
 terraform -chdir=infra/terraform init

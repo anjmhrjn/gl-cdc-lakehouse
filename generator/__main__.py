@@ -17,28 +17,28 @@ from datetime import UTC, datetime, timedelta
 from generator import mess, model
 from generator.emit import LocalSink, S3Sink
 
-# The run's lsn counter starts here. Late arrivals draw from the band below it so
-# their lsn is genuinely older than events already processed, not just their ts_ms.
-START_LSN = 5_000_000
-PREHISTORY_LO = 1_000_000
+# lsn is anchored to wall-clock time: LSN_PER_MS slots per millisecond. Real log sequence
+# numbers only ever grow, across runs as well as within one. A fixed starting value would
+# give two runs the same (key, lsn) with different rows, which no ordering can resolve.
+# A run's events take far fewer than LSN_PER_MS * (time to the next run) slots, so a
+# later run always sequences after an earlier one.
+LSN_PER_MS = 100
 
 ACCOUNT_EVENT_SHARE = 0.15
 
 
 class Lsn:
-    def __init__(self, rng: random.Random):
+    def __init__(self, rng: random.Random, now: datetime):
         self.rng = rng
-        self.value = START_LSN
+        self.value = model.ms(now) * LSN_PER_MS
 
     def next(self) -> int:
         self.value += self.rng.randint(1, 64)
         return self.value
 
-    def backdated(self, hours_late: float, late_hours: float) -> int:
-        """An lsn inside the prehistory band, older the further back the event sits."""
-        span = START_LSN - PREHISTORY_LO
-        fraction = 1.0 - min(hours_late / late_hours, 1.0)
-        return PREHISTORY_LO + int(span * fraction)
+    def backdated(self, at: datetime) -> int:
+        """The lsn a change made at `at` would have had. Always below this run's lsns."""
+        return model.ms(at) * LSN_PER_MS + self.rng.randint(0, LSN_PER_MS - 1)
 
 
 def build_groups(accounts: list[dict]) -> dict[tuple[str, str], list[dict]]:
@@ -75,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
 
     end = datetime.now(UTC).replace(second=0, microsecond=0)
     start = end - timedelta(minutes=args.minutes)
-    lsn = Lsn(rng)
+    lsn = Lsn(rng, end)
     stats: Counter[str] = Counter()
 
     accounts = [model.make_account(rng, i, start) for i in range(1, args.accounts + 1)]
@@ -108,15 +108,9 @@ def main(argv: list[str] | None = None) -> int:
     for acct in accounts:
         if acct["account_id"] in late_accounts:
             release = rng.randint(max(1, args.minutes // 2), max(1, args.minutes - 1))
-            hours_late = rng.uniform(1.0, args.late_hours)
+            created = start - timedelta(hours=rng.uniform(1.0, args.late_hours))
             event = model.envelope(
-                "c",
-                "accounts",
-                lsn.backdated(hours_late, args.late_hours),
-                rng.randint(1, 10**6),
-                start - timedelta(hours=hours_late),
-                None,
-                acct,
+                "c", "accounts", lsn.backdated(created), rng.randint(1, 10**6), created, None, acct
             )
             queue_late(release, "accounts", event)
             stats["late"] += 1
@@ -161,9 +155,9 @@ def main(argv: list[str] | None = None) -> int:
                 by_id[after["account_id"]] = after
                 event = model.envelope("u", "accounts", lsn.next(), tx, landed, before, after)
                 if rng.random() < mess.LATE_RATE and minute < args.minutes - 1:
-                    hours_late = rng.uniform(1.0, args.late_hours)
-                    event["source"]["lsn"] = lsn.backdated(hours_late, args.late_hours)
-                    event["ts_ms"] = model.ms(landed - timedelta(hours=hours_late))
+                    changed = landed - timedelta(hours=rng.uniform(1.0, args.late_hours))
+                    event["source"]["lsn"] = lsn.backdated(changed)
+                    event["ts_ms"] = model.ms(changed)
                     queue_late(rng.randint(minute + 1, args.minutes - 1), "accounts", event)
                     stats["late"] += 1
                 else:

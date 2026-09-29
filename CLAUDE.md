@@ -209,6 +209,7 @@ Each environment has its own catalog: `gl_dev`, `gl_prod`.
   - what was wrong
   - how it was caught
   - the fix
+- **Log Terraform actions.** Every `terraform` command that changes state or reveals something (`init`, `plan`, `apply`, `import`, `state` operations) gets an entry at the top of `notes/terraform-log.md`: the command, who ran it, why, the result, and what it teaches. Also log manual infrastructure steps that Terraform could not do. The file is gitignored local learning notes, not project documentation.
 - **Keep it simple.** No abstractions, frameworks, or tools beyond what this file scopes.
 - **Docs style:** plain, direct language. No marketing words. No em dashes.
 

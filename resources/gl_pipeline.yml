@@ -1,0 +1,21 @@
+resources:
+  pipelines:
+    gl_pipeline:
+      name: gl_pipeline_${var.env}
+      catalog: ${var.catalog}
+      # Default schema only. Tables are written with fully qualified names so one
+      # pipeline can publish to bronze, silver and gold.
+      schema: silver
+      serverless: true
+      # Never continuous. Dev is triggered by hand; prod gets a schedule in checkpoint 5.
+      continuous: false
+      channel: CURRENT
+      # src/ goes on sys.path, so pipeline files import `transforms.cdc` exactly as the
+      # unit tests do.
+      root_path: ../src
+      libraries:
+        - glob:
+            include: ../src/pipelines/**
+      configuration:
+        gl.catalog: ${var.catalog}
+        gl.landing_root: ${var.landing_root}
