@@ -44,12 +44,12 @@ def money(cents: int) -> str:
     return f"{sign}{cents // 100}.{cents % 100:02d}"
 
 
-def make_account(rng: random.Random, index: int, now: datetime) -> dict:
+def make_account(rng: random.Random, account_id: str, now: datetime) -> dict:
     opened = now - timedelta(days=rng.randint(30, 3000), minutes=rng.randint(0, 1440))
     first = rng.choice(_FIRST_NAMES)
     last = rng.choice(_LAST_NAMES)
     return {
-        "account_id": f"ACC-{index:06d}",
+        "account_id": account_id,
         "account_number": f"{rng.randint(10**11, 10**12 - 1)}",
         "holder_name": f"{first} {last}",
         "holder_email": f"{first.lower()}.{last.lower()}@example.com",
@@ -99,6 +99,7 @@ def make_journal(
     accounts: list[dict],
     now: datetime,
     entry_day: date,
+    entry_prefix: str,
     start_index: int,
 ) -> list[dict]:
     """Build one balanced journal.
@@ -133,7 +134,7 @@ def make_journal(
     for offset, (acct, side, cents) in enumerate(amounts):
         rows.append(
             {
-                "entry_id": f"JE-{start_index + offset:09d}",
+                "entry_id": f"{entry_prefix}-{start_index + offset:06d}",
                 "journal_id": journal_id,
                 "account_id": acct["account_id"],
                 "entry_date": entry_day.isoformat(),

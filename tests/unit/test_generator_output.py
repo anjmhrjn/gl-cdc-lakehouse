@@ -1,6 +1,7 @@
 """Real generator output through the reference, to catch schema drift between the two."""
 
 import generator.__main__ as gen
+from conftest import generated_events
 from transforms import cdc
 
 
@@ -34,3 +35,60 @@ def test_generator_files_parse_and_sequence(spark, tmp_path, capsys):
     live_ids = cdc.expected_scd1(events["accounts"], "accounts").select("account_id")
     assert open_ids.count() == live_ids.count()
     assert open_ids.exceptAll(live_ids).count() == 0
+
+
+def account_ids(events, table):
+    """Account ids touched by a table's events, from after or before."""
+    pk = "account_id"
+    return {r[pk] for r in events[table].select(pk).filter(f"{pk} IS NOT NULL").collect()}
+
+
+def test_withheld_accounts_arrive_only_in_the_follow_up_run(spark, tmp_path, capsys):
+    first, second = tmp_path / "first", tmp_path / "second"
+    common = ["--env", "dev", "--minutes", "5", "--rate", "200"]
+    gen.main([*common, "--withhold-late-accounts", "--out-dir", str(first)])
+    gen.main([*common, "--only-late-accounts", "--out-dir", str(second)])
+    capsys.readouterr()
+
+    run1 = generated_events(spark, first)
+    run2 = generated_events(spark, second)
+
+    # The follow-up run holds only creates, for accounts the first run never mentioned
+    # but did post journal lines against.
+    late = account_ids(run2, "accounts")
+    assert len(late) == 3
+    assert {r["_op"] for r in run2["accounts"].collect()} == {"c"}
+    assert late.isdisjoint(account_ids(run1, "accounts"))
+    assert late & account_ids(run1, "journal_entries")
+    assert not (second / "dev" / "cdc" / "journal_entries").exists()
+
+
+def test_runs_add_rows_instead_of_overwriting_them(spark, tmp_path, capsys):
+    """Journal lines, journals, new accounts and landing files are unique per run.
+
+    Only the base accounts share ids across runs: each run re-reads the same accounts.
+    """
+    common = ["--env", "dev", "--minutes", "3", "--rate", "100", "--out-dir", str(tmp_path)]
+    gen.main(common)
+    first_files = set((tmp_path / "dev").rglob("*.json"))
+    first = generated_events(spark, tmp_path)
+    first_ids = {
+        column: {r[0] for r in first["journal_entries"].select(column).distinct().collect()}
+        for column in ("entry_id", "journal_id")
+    }
+    first_accounts = account_ids(first, "accounts")
+    spark.catalog.clearCache()
+
+    gen.main(common)
+    capsys.readouterr()
+    both = generated_events(spark, tmp_path)
+
+    # Same minute, same seed: the second run still lands next to the first, not over it.
+    assert first_files < set((tmp_path / "dev").rglob("*.json"))
+    for column, ids in first_ids.items():
+        rows = both["journal_entries"].filter(f"{column} IS NOT NULL")
+        assert rows.select(column).distinct().count() > len(ids)
+
+    base = {f"ACC-{i:06d}" for i in range(1, 201)}
+    new_accounts = account_ids(both, "accounts") - base
+    assert first_accounts - base < new_accounts

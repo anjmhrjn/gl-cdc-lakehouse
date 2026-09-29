@@ -100,7 +100,7 @@ and recent `dt=`/`hh=` partitions, so Auto Loader sees them as new arrivals.
 
 ### Landing partitions use landing time, not event time
 
-Files are keyed `cdc/<table>/dt=YYYY-MM-DD/hh=HH/part-<epoch>-<seq>.json`. A late
+Files are keyed `cdc/<table>/dt=YYYY-MM-DD/hh=HH/part-<epoch>-<run>-<seq>.json`. A late
 arriving event therefore sits in a fresh partition while carrying an old `lsn`. That is
 exactly the case bronze and silver have to handle, and partitioning by event time would
 hide it.
@@ -113,6 +113,27 @@ run at 5,000,000, so two runs landed different rows under the same (key, lsn), w
 ordering can resolve (see `AI_USAGE.md`). Anchoring to time means a later run always
 sequences after an earlier one: a run's events use at most 64 slots each, far fewer than
 the 100 slots per millisecond between runs.
+
+The anchor is the run's actual start time. Until checkpoint 3 it was the window end,
+rounded down to the minute, so two runs started in the same minute began at the same
+lsn.
+
+### Ids are unique per run, except the base accounts
+
+Each run has a run tag, its start time in milliseconds. Journal ids
+(`JRN-<run>-<n>`), entry ids (`JE-<run>-<n>`), accounts opened during the run
+(`ACC-<run>-<n>`) and landing file names all carry it. The base accounts,
+`ACC-000001` to `ACC-000200`, keep the same ids in every run: each run re-reads the same
+accounts, the way a real source would.
+
+Until checkpoint 3 journal and entry ids were counters that restarted at 1 every run. A
+new run therefore overwrote the previous run's journal lines by key instead of adding
+to them (see `AI_USAGE.md`). File names had the same problem: two runs started in the
+same minute wrote the same S3 keys, replacing files the pipeline had already ingested.
+
+One consequence: the held-back "late" accounts are base accounts, so they are only
+really late on an empty landing prefix. On a prefix that already has a run, they exist
+in silver before their late create arrives, and the create just adds a version.
 
 ### Late arrivals get a genuinely older lsn
 
@@ -251,3 +272,196 @@ Run on 2026-09-29 by Anuj, after clearing the old landing files. Generator:
 - Both things the docs left open held up in practice. The unparseable lines did not fail
   the Auto Loader read, and since silver matches a reference that drops them, they did
   not reach silver. The check job runs on serverless environment version 5.
+
+## Checkpoint 3: Quality and gold
+
+### Every event goes exactly one way
+
+Per source table, silver routes each flattened event in this order:
+
+1. Unparseable (`_corrupt_record` is set): appended to `silver.quarantine_events` with
+   reason `unparseable_payload`.
+2. A drop rule fails (missing PK, null lsn, unknown op): dropped by
+   `expect_all_or_drop`, counted in the event log.
+3. A quarantine rule fails: appended to `silver.quarantine_events` with the names of
+   every rule it failed.
+   - `amount_positive`: `amount IS NOT NULL AND amount > 0` (journal_entries)
+   - `currency_known`: currency in the allowlist (both tables)
+4. Otherwise: into AUTO CDC.
+
+The order matters in one place. An unparseable line has no key, so if the drop rules ran
+first it would fail `pk_present` and vanish with only a count to show for it. Splitting
+unparseable rows off first means the raw text is kept where someone can read it.
+
+In the pipeline this is three temporary views per table (`_parsed`, `_checked`,
+`_valid`) and two append flows into `quarantine_events` (`_unparseable`, `_rejected`).
+Two flows rather than one union because the checked side carries a watermark from the
+dedupe and the parsed side does not. The quarantine rules also run as warn-only
+`expect_all` on the checked view, so their failure counts sit in the event log next to
+the drop counts.
+
+A NULL amount is quarantined, not passed through. It only happens when `try_cast`
+failed, and a ledger line with no amount is as unusable as a negative one.
+
+`quarantine_events` has one schema for both tables: `source_table`, `reasons`,
+`payload` (the unparseable line itself, or the envelope as JSON), `_op`, `_lsn`,
+`_ingested_at`, `_source_file`.
+
+### Unparseable rows skip the dedupe
+
+The dedupe keys on (pk, lsn). Both are null on an unparseable row, so every one of them
+would count as a duplicate of the others and collapse into a single row. `cdc.check`
+filters them out before the dedupe, and a unit test sends five distinct corrupt lines
+and expects five quarantine rows.
+
+### Currency is an allowlist
+
+`CURRENCIES = ("USD", "EUR", "GBP", "JPY")` in `transforms/cdc.py`, the currencies the
+ledger books in. A full ISO 4217 list would let the generator's `XXX` through, because
+`XXX` is a real ISO code meaning "no currency". A unit test keeps the allowlist equal to
+the generator's list.
+
+### Gold is two materialized views
+
+| Table | Grain | Columns |
+|---|---|---|
+| `gold.account_balances` | account, currency | line_count, debit_total, credit_total, balance |
+| `gold.daily_trial_balance` | business_unit, currency, entry_date | line_count, debit_total, credit_total, net |
+
+Materialized views rather than streaming tables, because both are aggregates over SCD1
+tables that change in place, and a late account changes groups that were already
+aggregated. A materialized view is always its query over current silver, so a late
+account reconciles on the next update with no extra logic. The aggregation lives in
+`transforms/gold.py`, and the pipeline, the unit tests and the state check all call it.
+
+`balance` follows the account type's normal side: debits minus credits for ASSET and
+EXPENSE, credits minus debits for LIABILITY, EQUITY and REVENUE. A healthy liability
+reads as positive, the way a ledger does. `net` in the trial balance is always debits
+minus credits and is zero when the books balance.
+
+### Account attributes come from the latest history version
+
+Gold takes business_unit and account_type from the newest version of each account in
+`silver.account_history`, not from `silver.accounts`. The generator deletes accounts
+whose journal lines stay live. Joined to `silver.accounts`, those lines would lose
+their business unit forever and the trial balance for that unit would never net to
+zero. The closed SCD2 version still records the unit. The generator also changes
+account_type on updates, so the latest version decides the sign of the balance.
+
+### Orphan lines stay in gold
+
+A journal line whose account has never landed is kept through a left join, with a NULL
+business_unit and account_type. Its balance is NULL too, because the sign depends on a
+type nobody knows yet. Nothing is dropped, so gold never loses money quietly.
+`account_balances` carries a warn-only `account_known` expectation that counts these
+rows.
+
+While an account is late, the trial balance shows it: the NULL group has a non-zero
+net, and so does the account's real unit. Once the account lands, the next update puts
+the lines under the right unit and both groups net to zero.
+
+### Proving reconciliation across two updates
+
+In a normal generator run the held-back accounts land later in the same run, so a
+single pipeline update sees them together with their journal lines. Two flags split
+that into two runs:
+
+- `--withhold-late-accounts` writes everything except the three late accounts. They get
+  no create, update or delete, because an update would create the row.
+- `--only-late-accounts`, with the same `--seed` and `--accounts`, writes only their
+  create events. The same seed picks the same accounts, because everything before
+  that choice draws from the seeded generator the same way in every mode.
+
+### The state check covers quarantine and gold
+
+`silver_state_check` compares silver, `quarantine_events` and both gold tables with the
+reference computed from the landing files. Quarantine is compared without
+`_ingested_at` and `_source_file`, which change on every rebuild. The check also prints
+quarantine counts per reason and the number of unbalanced and orphan trial balance
+groups.
+
+Spark refuses a query on raw JSON files that reads only `_corrupt_record`. A count of
+the unparseable reference rows is such a query, and serverless does not support
+`cache()`, the usual way around it. So the check never counts the expected frame
+directly: it derives the expected count as actual minus extra plus missing, from
+`exceptAll` results, which read every column. Bronze is a Delta table, so the pipeline
+itself is not affected.
+
+Open source Spark 4.0.1 (the local test version) fails with an `INTERNAL_ERROR` when
+`exceptAll` runs over the SCD1 reference (a window with a `rank = 1` filter). The same
+code ran on Databricks in checkpoint 2, and the checkpoint 2 version of `cdc.py` fails
+the same way locally, so this is a local Spark problem and not a checkpoint 3 change.
+The unit tests do not use `exceptAll`.
+
+### Verified on dev
+
+**First run, 2026-09-29, by Anuj.** Steps: deploy, full refresh, generator with
+`--withhold-late-accounts`, update, `silver_state_check`, generator with
+`--only-late-accounts`, update, `silver_state_check`, full refresh,
+`silver_state_check`. The landing prefix still held the checkpoint 2 run.
+
+| Table | Rows | Missing | Extra | Checksum after follow-up and after full refresh |
+|---|---|---|---|---|
+| silver.accounts | 203 | 0 | 0 | -74444556911398783622 |
+| silver.account_history | 558 | 0 | 0 | -126861808956568470557 |
+| silver.journal_entries | 415 | 0 | 0 | -176125579209857999422 |
+| silver.quarantine_events | 7 | 0 | 0 | 14739086700574879462 |
+| gold.account_balances | 148 | 0 | 0 | 32754967820805642471 |
+| gold.daily_trial_balance | 31 | 0 | 0 | -7434261366217672374 |
+
+Quarantine reasons: accounts `currency_known` 2; journal_entries `amount_positive` 3,
+`currency_known` 3, `unparseable_payload` 2. The trial balance had 0 unbalanced groups
+in all three checks.
+
+- Silver, quarantine and gold matched the reference row for row in all three checks.
+- The checks before and after the full refresh have identical checksums, so a rebuild
+  from the same landing files gives identical tables.
+- Unparseable lines reached quarantine through Auto Loader and bronze with their text
+  intact, which the unit tests could only show for a plain Spark read.
+- Reconciliation was **not** proven. The first check already had 0 orphan groups,
+  because the "late" accounts were base accounts that the checkpoint 2 run had landed.
+  After the follow-up run `account_history` grew from 555 to 558 rows while `accounts`
+  stayed at 203: the three late creates became extra versions of existing accounts.
+  The run also showed journal ids restarting at 1 every run (415 journal lines after
+  two full runs, 410 after one). Both are fixed in the generator, see "Ids are unique
+  per run" above.
+
+**Second run, 2026-09-29, by Anuj**, after the id fix. Steps: clear
+`s3://gl-cdc-lakehouse-anuj/dev/cdc/`, generator with `--withhold-late-accounts`
+(`--minutes 10 --rate 50`, seed 42), full refresh, check 1, generator with
+`--only-late-accounts`, update, check 2, full refresh, check 3.
+
+| Table | Check 1 rows | Check 2 rows | Check 2 and 3 checksum |
+|---|---|---|---|
+| silver.accounts | 200 | 203 | -70670424421286850505 |
+| silver.account_history | 276 | 279 | 82629327533479081107 |
+| silver.journal_entries | 415 | 415 | 34881271539060652540 |
+| silver.quarantine_events | 3 | 3 | 1000157484841228543 |
+| gold.account_balances | 148 | 148 | 32754967820805642471 |
+| gold.daily_trial_balance | 36 | 31 | -7434261366217672374 |
+
+Every table matched the reference with 0 missing and 0 extra in all three checks.
+Quarantine reasons: accounts `currency_known` 1; journal_entries `amount_positive` 1,
+`currency_known` 1, `unparseable_payload` 1.
+
+| Trial balance | Check 1 | Check 2 | Check 3 |
+|---|---|---|---|
+| Unbalanced groups | 10 | 0 | 0 |
+| Orphan groups (NULL business_unit) | 5 | 0 | 0 |
+
+- **Late accounts reconcile.** Check 1 had 5 orphan groups holding the withheld
+  accounts' lines, and 5 real business unit groups short by the same amounts, so 10
+  unbalanced groups. After the three accounts landed, the next update moved their lines
+  under the right unit and every group netted to zero. The 36 trial balance rows became
+  31 because the 5 NULL groups merged into existing ones. `account_balances` kept 148
+  rows: the orphan rows were the same accounts, now with their unit and type filled in.
+- **Rebuilds are idempotent.** Checks 2 and 3 have identical checksums on every table,
+  so a full refresh over the same landing files gives identical silver, quarantine and
+  gold.
+- These numbers match a local simulation of the same commands run beforehand (10
+  unbalanced and 5 orphan groups, then 0 and 0).
+- Both gold checksums after reconciliation equal the ones from the first run. Gold
+  aggregates amounts per account, unit, currency and date, and holds no ids or
+  timestamps. Both runs used seed 42 on the same day, so they produced the same amounts
+  on the same accounts and dates. That fits the id fix: only ids changed between the
+  runs, and gold does not see ids.

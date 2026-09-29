@@ -2,7 +2,7 @@ resources:
   jobs:
     silver_state_check:
       name: silver_state_check_${var.env}
-      description: Integration test. Compares silver tables with the reference state computed from the landing files.
+      description: Integration test. Compares silver, quarantine and gold tables with the reference state computed from the landing files.
       environments:
         - environment_key: default
           spec:

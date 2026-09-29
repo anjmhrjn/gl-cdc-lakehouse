@@ -27,6 +27,18 @@ LSN_PER_MS = 100
 ACCOUNT_EVENT_SHARE = 0.15
 
 
+def run_tag(now: datetime) -> str:
+    """Identifies one run: its start time in milliseconds, not rounded to the minute.
+
+    Journal ids, entry ids, ids of accounts opened during the run and landing file
+    names all carry it. With plain counters every run restarted at JE-000000001, so a
+    new run overwrote the previous run's journal lines by key instead of adding to them.
+    The base accounts keep stable ids: each run re-reads the same accounts, as a real
+    source would.
+    """
+    return str(model.ms(now))
+
+
 class Lsn:
     def __init__(self, rng: random.Random, now: datetime):
         self.rng = rng
@@ -62,6 +74,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--profile", default="gl-lakehouse")
     p.add_argument("--region", default="us-east-2")
     p.add_argument("--out-dir", help="write locally instead of S3")
+    # Two halves of one test: the late accounts' journal lines land in one pipeline
+    # update and the accounts themselves in the next. Use the same --seed and --accounts.
+    late = p.add_mutually_exclusive_group()
+    late.add_argument(
+        "--withhold-late-accounts",
+        action="store_true",
+        help="leave the late accounts out entirely; their journal lines are still written",
+    )
+    late.add_argument(
+        "--only-late-accounts",
+        action="store_true",
+        help="write only the late accounts' create events, then stop",
+    )
     return p.parse_args(argv)
 
 
@@ -73,12 +98,16 @@ def main(argv: list[str] | None = None) -> int:
     else:
         sink = S3Sink(args.bucket, args.profile, args.region)
 
-    end = datetime.now(UTC).replace(second=0, microsecond=0)
+    now = datetime.now(UTC)
+    run = run_tag(now)
+    end = now.replace(second=0, microsecond=0)
     start = end - timedelta(minutes=args.minutes)
-    lsn = Lsn(rng, end)
+    lsn = Lsn(rng, now)
     stats: Counter[str] = Counter()
 
-    accounts = [model.make_account(rng, i, start) for i in range(1, args.accounts + 1)]
+    accounts = [
+        model.make_account(rng, f"ACC-{i:06d}", start) for i in range(1, args.accounts + 1)
+    ]
     by_id = {a["account_id"]: a for a in accounts}
     groups = build_groups(accounts)
     if not groups:
@@ -105,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
         for a in accounts
         if a["account_id"] not in late_accounts
     ]
+    late_creates = []
     for acct in accounts:
         if acct["account_id"] in late_accounts:
             release = rng.randint(max(1, args.minutes // 2), max(1, args.minutes - 1))
@@ -112,6 +142,19 @@ def main(argv: list[str] | None = None) -> int:
             event = model.envelope(
                 "c", "accounts", lsn.backdated(created), rng.randint(1, 10**6), created, None, acct
             )
+            late_creates.append((release, event))
+
+    # Everything above draws from rng identically in every mode, so the same seed picks
+    # the same late accounts in a --withhold-late-accounts run and in the follow-up.
+    if args.only_late_accounts:
+        sink.write(args.env, "accounts", [e for _, e in late_creates], end, run, 0)
+        print(f"sink            {sink.describe()}/{args.env}/cdc/")
+        print(f"late accounts   {', '.join(sorted(late_accounts))}")
+        return 0
+
+    withheld = late_accounts if args.withhold_late_accounts else set()
+    for release, event in late_creates:
+        if not withheld:
             queue_late(release, "accounts", event)
             stats["late"] += 1
 
@@ -135,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             roll = rng.random()
             if roll < 0.05:
                 idx = len(by_id) + 1
-                acct = model.make_account(rng, idx, landed)
+                acct = model.make_account(rng, f"ACC-{run}-{idx:06d}", landed)
                 by_id[acct["account_id"]] = acct
                 accounts.append(acct)
                 batch["accounts"].append(
@@ -143,14 +186,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
             elif roll < 0.06:
                 candidates = [
-                    a for a in accounts if a["account_id"] != hot_account["account_id"]
+                    a
+                    for a in accounts
+                    if a["account_id"] != hot_account["account_id"]
+                    and a["account_id"] not in withheld
                 ]
                 victim = rng.choice(candidates)
                 batch["accounts"].append(
                     model.envelope("d", "accounts", lsn.next(), tx, landed, victim, None)
                 )
             else:
-                before = rng.choice(accounts)
+                # A withheld account gets no events at all, or an update would create it.
+                before = rng.choice([a for a in accounts if a["account_id"] not in withheld])
                 after = model.mutate_account(rng, before, landed)
                 by_id[after["account_id"]] = after
                 event = model.envelope("u", "accounts", lsn.next(), tx, landed, before, after)
@@ -195,7 +242,13 @@ def main(argv: list[str] | None = None) -> int:
                 key = rng.choice([k for k in groups if k != hot_group_key])
             entry_day = (landed - timedelta(days=rng.randint(0, 2))).date()
             rows = model.make_journal(
-                rng, f"JRN-{journal_seq:08d}", groups[key], landed, entry_day, entry_seq
+                rng,
+                f"JRN-{run}-{journal_seq:06d}",
+                groups[key],
+                landed,
+                entry_day,
+                f"JE-{run}",
+                entry_seq,
             )
             journal_seq += 1
             entry_seq += len(rows)
@@ -228,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
                     events.append(mess.malformed_record(rng, table, lsn.next()))
                     stats["malformed"] += 1
             events = mess.shuffle_within_file(rng, events)
-            sink.write(args.env, table, events, landed, minute)
+            sink.write(args.env, table, events, landed, run, minute)
             files += 1
             stats[table] += len(events)
 
@@ -239,11 +292,12 @@ def main(argv: list[str] | None = None) -> int:
             leftover[table].append(event)
     for table, events in leftover.items():
         if events:
-            sink.write(args.env, table, events, end, args.minutes)
+            sink.write(args.env, table, events, end, run, args.minutes)
             files += 1
             stats[table] += len(events)
 
     print(f"sink            {sink.describe()}/{args.env}/cdc/")
+    print(f"run             {run}")
     print(f"window          {model.iso(start)} .. {model.iso(end)}")
     print(f"files           {files}")
     print(f"accounts        {stats['accounts']} events (snapshot {stats['snapshot']})")
@@ -251,6 +305,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"duplicates      {stats['duplicates']}")
     print(f"malformed       {stats['malformed']}")
     print(f"late arrivals   {stats['late']}")
+    if withheld:
+        print(f"withheld        {', '.join(sorted(withheld))}, land with --only-late-accounts")
     print(f"hot account     {hot_account['account_id']} ({hot_group_key[0]}/{hot_group_key[1]})")
     return 0
 

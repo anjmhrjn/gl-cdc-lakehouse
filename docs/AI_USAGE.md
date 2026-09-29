@@ -70,3 +70,58 @@ script over two local runs confirmed the overlap.
 late event gets the lsn of its backdated time. Two back-to-back local runs now produce
 zero conflicting (key, lsn) pairs. Anuj removed the old dev landing files before the
 first pipeline run, and silver then matched the reference exactly.
+
+## Reconciliation test read stale cached data
+
+**Produced:** a unit test that runs the generator with `--withhold-late-accounts`,
+computes gold, runs it again with `--only-late-accounts` into the same directory, and
+expects every orphan to be gone.
+
+**Wrong:** the test helper caches the raw JSON read, to get around Spark refusing a
+query that reads only `_corrupt_record`. The second read of the same path matched the
+cached plan from the first read, so it never saw the new files. The test reported five
+orphan groups after the late accounts had landed.
+
+**Caught by:** the test itself failing, then a fresh process over the same two runs
+showing zero orphans. So the generator was right and the test was reading old data.
+
+**Fix:** the test calls `spark.catalog.clearCache()` between the two runs, with a comment
+saying why.
+
+## Generator ids restarted at 1 every run
+
+**Produced:** the checkpoint 1 generator numbered journals and journal lines with
+counters that started at 1 in every run (`JRN-00000001`, `JE-000000001`). New accounts
+were numbered on from the base accounts, so they restarted too. Landing file names used
+the minute and a per-run counter.
+
+**Wrong:** a CDC source never reuses a primary key for a different row. Each run
+overwrote the previous run's journal lines by key instead of adding to them, so row
+counts stopped growing across runs. That would have distorted the tuning experiments
+and the replay tests. Two runs started in the same minute also wrote the same S3 keys.
+The pipeline and the reference both handled this correctly, which is why no check
+failed.
+
+**Caught by:** Anuj's checkpoint 3 dev run. `silver.journal_entries` had 415 rows after
+two full generator runs, against 410 after one in checkpoint 2.
+
+**Fix:** a run tag (the run's start time in milliseconds) in journal ids, entry ids,
+ids of accounts opened during the run, and file names. `lsn` is anchored to the same
+unrounded time instead of the minute. The base accounts keep stable ids on purpose. A
+unit test runs the generator twice in the same minute with the same seed and checks
+that the second run adds files, journals and lines instead of replacing them.
+
+## Told Anuj to expect orphans that could not appear
+
+**Produced:** dev run instructions saying the first `silver_state_check` after the
+`--withhold-late-accounts` run would show orphan groups in the trial balance.
+
+**Wrong:** I did not check what the landing prefix already held. The held-back accounts
+are base accounts with fixed ids, and the checkpoint 2 run had already landed them. So
+the journal lines found their accounts and there were no orphans. The unit test for
+reconciliation passed because it starts from an empty directory.
+
+**Caught by:** Anuj's run: 0 orphan groups in the first check.
+
+**Fix:** the reconciliation proof runs on an empty dev landing prefix. ARCHITECTURE.md
+now states that the late accounts are only late on an empty prefix.

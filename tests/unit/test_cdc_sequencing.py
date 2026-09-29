@@ -117,12 +117,13 @@ def test_types_are_cast(load_events):
     assert row["posted_at"].year == 2026
 
 
-def test_bad_amount_string_becomes_null_not_error(load_events):
-    events = load_events(
+def test_bad_amount_string_becomes_null_not_error(load_flat):
+    # The NULL amount is then quarantined; see test_quarantine.py.
+    events = load_flat(
         "journal_entries",
         [event("c", 10, table="journal_entries", after=entry("JE-1", amount="abc"))],
     )
-    assert state(events, "journal_entries")["JE-1"]["amount"] is None
+    assert events.collect()[0]["amount"] is None
 
 
 def test_scd1_columns_match_contract(load_events):

@@ -61,10 +61,11 @@ def entry(entry_id, amount="100.00", side="DEBIT", description="Fee accrual"):
 
 
 @pytest.fixture
-def load_events(spark, tmp_path):
+def load_flat(spark, tmp_path):
     """Write records as an NDJSON landing file and read them back the way bronze does.
 
     Records can be dicts or raw strings, so malformed lines go through the real parser.
+    Returns every flattened event, before drop rules, dedupe and quarantine.
     """
     counter = iter(range(10**6))
 
@@ -72,7 +73,36 @@ def load_events(spark, tmp_path):
         path = tmp_path / f"{table}-{next(counter)}.json"
         lines = [r if isinstance(r, str) else json.dumps(r) for r in records]
         path.write_text("\n".join(lines) + "\n")
-        raw = cdc.read_landing(spark.read, table).json(str(path))
-        return cdc.clean_events(cdc.flatten(raw, table), table)
+        # Cached because Spark refuses a query on raw JSON that reads only _corrupt_record,
+        # which is all a count() of unparseable rows needs.
+        raw = cdc.read_landing(spark.read, table).json(str(path)).cache()
+        return cdc.flatten(raw, table)
 
     return _load
+
+
+@pytest.fixture
+def load_events(load_flat):
+    """Like load_flat, but only the events that reach AUTO CDC."""
+
+    def _load(table, records):
+        return cdc.clean_events(load_flat(table, records), table)
+
+    return _load
+
+
+def generated_events(spark, root):
+    """Flattened events per table from a local generator run under `root`.
+
+    A table the run wrote nothing for is left out.
+    """
+    events = {}
+    for table in cdc.TABLES:
+        path = root / "dev" / "cdc" / table
+        if not path.exists():
+            continue
+        path = str(path)
+        # Cached because Spark refuses a query on raw JSON that reads only _corrupt_record.
+        raw = cdc.read_landing(spark.read, table).json(path).cache()
+        events[table] = cdc.flatten(raw, table)
+    return events
