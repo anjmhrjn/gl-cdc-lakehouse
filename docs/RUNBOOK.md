@@ -208,8 +208,10 @@ A deploy starts no compute. Schedules stay paused unless `schedule_pause` is set
   `DATABRICKS_TOKEN_AUDIENCE`.
 - **Token exchange refused** (401 or 403 from `github-oidc`): the token does not match
   the federation policy. The policy subject must match the job's environment exactly
-  (`repo:anjmhrjn/gl-cdc-lakehouse:environment:dev` or `...:prod`), and its audience
-  must equal `DATABRICKS_TOKEN_AUDIENCE`.
+  (`repo:anjmhrjn@57608084/gl-cdc-lakehouse@1396470167:environment:dev` or
+  `...:prod`), and the policy audience must equal `DATABRICKS_TOKEN_AUDIENCE`. The
+  refusal message prints the subject and audience the token carried, under "Valid
+  federation policy for provided token".
 - **Deployment lock held:** another deploy of the same target is running, or one
   crashed. Wait for it. If it crashed, deploy once with `--force-lock` from a laptop.
 - **Validation error:** fix it in a pull request. `pr.yml` runs the same validation.

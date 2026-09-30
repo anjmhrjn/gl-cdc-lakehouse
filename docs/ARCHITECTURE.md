@@ -917,15 +917,26 @@ profile named, CLI 1.8.0 ignores `DATABRICKS_AUTH_TYPE` from the environment, so
 environment variables alone fail in CI. Each workflow runs
 `.github/scripts/databricks-profiles.sh` first, which writes both profiles into the
 runner's `~/.databrickscfg` with `auth_type = github-oidc`. The profiles also set
-`audience` to the account ID, the audience the federation policies accept. Without it,
+`audience` from the `DATABRICKS_TOKEN_AUDIENCE` repository variable, which must equal
+the audience in the federation policies: the `gl-cicd` application ID. The audience is
+only a value the token and the policy must agree on. The Databricks docs suggest the
+account ID; the application ID works the same, and ties tokens to this one service
+principal's policies. Without it,
 the CLI asks GitHub for a token whose audience is the workspace token endpoint (read
 from the SDK source, `determineAudience`), and the exchange would be refused.
 
 The policies trust GitHub environments, not branches:
 
-- `repo:anjmhrjn/gl-cdc-lakehouse:environment:dev` for PR validation and the deploy on
-  merge to main
-- `repo:anjmhrjn/gl-cdc-lakehouse:environment:prod` for the deploy on a `v*` tag
+- `repo:anjmhrjn@57608084/gl-cdc-lakehouse@1396470167:environment:dev` for PR
+  validation and the deploy on merge to main
+- `repo:anjmhrjn@57608084/gl-cdc-lakehouse@1396470167:environment:prod` for the deploy
+  on a `v*` tag
+
+GitHub puts the numeric owner and repository IDs next to the names in the token
+subject for this repository, so the subject is not the `repo:<owner>/<repo>:...` form
+in the Databricks example. The IDs tie the policy to this repository: a repository
+created later under the same name would have a different ID and would not match. The
+subject a job actually sends is printed in the error when the exchange is refused.
 
 The prod environment in GitHub only accepts `v*` tags, so no branch or pull request can
 get a token through the prod policy. A branch subject (`ref:refs/heads/main`) would not

@@ -248,8 +248,8 @@ the `gl-dev` profile is missing, but not which auth type it then uses.
 - `databricks.yml` names a profile for each target. With a profile named, CLI 1.8.0
   ignores `DATABRICKS_AUTH_TYPE` from the environment, so no auth method was chosen.
 - Even with the auth type fixed, the CLI requests the GitHub token with the workspace
-  token endpoint as audience. The federation policy expects the account ID, so the
-  exchange would have been refused next.
+  token endpoint as audience. The federation policy lists the `gl-cicd` application
+  ID as its audience, so the exchange would have been refused next.
 
 **Caught by:** the first pull request. `validate` failed with `default auth: cannot
 configure default credentials`, and the config it printed had `profile=gl-dev` and no
@@ -262,3 +262,21 @@ URL ended in `audience=https://<workspace>/oidc/v1/token`. The Go SDK's
 profiles on the runner with `auth_type = github-oidc`, `client_id` and `audience`, from
 repository variables. Checked locally with a fake token URL: both targets now request
 the token through `github-oidc` with the configured audience.
+
+## Federation policy subject in the wrong format
+
+**Produced:** the subjects I gave Anuj for the `gl-cicd` federation policies,
+`repo:anjmhrjn/gl-cdc-lakehouse:environment:dev` and `...:prod`, copied from the
+format in the Databricks GitHub Actions example.
+
+**Wrong:** the tokens GitHub issues for this repository carry the numeric owner and
+repository IDs in the subject:
+`repo:anjmhrjn@57608084/gl-cdc-lakehouse@1396470167:environment:dev`. An exact match
+against the name-only form fails.
+
+**Caught by:** the second run of `pr.yml`. The token exchange returned
+`TOKEN_SUBJECT_INVALID` and printed the subject the token carried.
+
+**Fix:** the policies use the subject GitHub actually sends. ARCHITECTURE.md and
+RUNBOOK.md list it, and the RUNBOOK says where the refusal message shows the real
+subject and audience.

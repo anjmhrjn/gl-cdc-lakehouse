@@ -5,9 +5,9 @@
 # profile the CLI ignores DATABRICKS_AUTH_TYPE from the environment and fails with
 # "cannot configure default credentials". So CI writes the profiles themselves.
 #
-# audience must match the federation policy. For a workspace host the CLI otherwise
-# asks GitHub for a token with the workspace token endpoint as audience, not the
-# account ID the policy expects.
+# audience must match the federation policy's audience (the gl-cicd application ID).
+# For a workspace host the CLI otherwise asks GitHub for a token with the workspace
+# token endpoint as audience, which the policy does not list.
 #
 # Nothing here is secret: the ID token is fetched at run time from GitHub.
 set -euo pipefail
