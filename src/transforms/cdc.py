@@ -295,15 +295,41 @@ def expected_scd1(events: DataFrame, table: str) -> DataFrame:
 
 
 def expected_scd2(events: DataFrame, table: str) -> DataFrame:
-    """Full history. Each non-delete event opens a version at its lsn, and the next event
-    for the same key (update or delete) closes it. __START_AT and __END_AT carry the
-    sequence value, which is what AUTO CDC writes for SCD type 2.
+    """Full history. Each non-delete event that changes the row opens a version at its
+    lsn, and the next such event or delete for the same key closes it. __START_AT and
+    __END_AT carry the sequence value, which is what AUTO CDC writes for SCD type 2.
+
+    An update whose values equal the previous event's is dropped first. AUTO CDC opens a
+    version only when a tracked column changes (all columns here), so an update that
+    changes nothing leaves the open version as it is. After a delete there is no open
+    version, so the same values open a new one.
+
+    A delete right after another delete has no open version to close. AUTO CDC then
+    writes a closed row from the delete's before image, with a NULL __START_AT and the
+    delete's lsn as __END_AT. This was observed on dev with the medium dataset and is not
+    in the docs, so it is modelled only for this case, the one that occurred.
     """
     pk = TABLES[table]["pk"]
     by_lsn = Window.partitionBy(pk).orderBy("_lsn")
-    return (
-        events.withColumn("__END_AT", F.lead("_lsn").over(by_lsn))
+    unchanged = F.lag("_op").over(by_lsn).isNotNull() & (F.lag("_op").over(by_lsn) != "d")
+    for column in TABLES[table]["columns"]:
+        if column != pk:
+            unchanged = unchanged & F.lag(column).over(by_lsn).eqNullSafe(F.col(column))
+    changes = (
+        events.withColumn("_unchanged", (F.col("_op") != "d") & unchanged)
+        .filter(~F.col("_unchanged"))
+        .drop("_unchanged")
+    )
+    versions = (
+        changes.withColumn("__END_AT", F.lead("_lsn").over(by_lsn))
         .filter("_op != 'd'")
         .withColumn("__START_AT", F.col("_lsn"))
-        .select(*TABLES[table]["columns"], "__START_AT", "__END_AT")
     )
+    repeated_deletes = (
+        changes.withColumn("_previous_op", F.lag("_op").over(by_lsn))
+        .filter("_op = 'd' AND _previous_op = 'd'")
+        .withColumn("__START_AT", F.lit(None).cast(changes.schema["_lsn"].dataType))
+        .withColumn("__END_AT", F.col("_lsn"))
+    )
+    columns = [*TABLES[table]["columns"], "__START_AT", "__END_AT"]
+    return versions.select(*columns).unionByName(repeated_deletes.select(*columns))

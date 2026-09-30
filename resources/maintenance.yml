@@ -1,0 +1,32 @@
+resources:
+  jobs:
+    maintenance:
+      name: maintenance_${var.env}
+      description: OPTIMIZE and VACUUM of the pipeline's streaming tables, on demand. Predictive optimization does the routine runs. See src/jobs/maintenance.py.
+      # No schedule: predictive optimization already maintains these tables.
+      max_concurrent_runs: 1
+      parameters:
+        - name: tables
+          default: ""
+        - name: vacuum
+          default: "true"
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "5"
+      tasks:
+        - task_key: maintain
+          environment_key: default
+          # OPTIMIZE and VACUUM are safe to repeat, so a transient failure can retry.
+          max_retries: 2
+          min_retry_interval_millis: 60000
+          retry_on_timeout: false
+          spark_python_task:
+            python_file: ../src/jobs/maintenance.py
+            parameters:
+              - --catalog
+              - ${var.catalog}
+              - --tables
+              - "{{job.parameters.tables}}"
+              - --vacuum
+              - "{{job.parameters.vacuum}}"

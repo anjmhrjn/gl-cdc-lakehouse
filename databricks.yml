@@ -27,20 +27,57 @@ variables:
   schedule_pause:
     description: PAUSED or UNPAUSED, for every schedule in this bundle
     default: PAUSED
+  max_files_per_trigger:
+    description: Auto Loader files per micro-batch in bronze. 1000 is Auto Loader's default.
+    default: "1000"
+  journal_target_file_size:
+    description: delta.targetFileSize for silver.journal_entries, or auto to let Databricks choose
+    default: auto
+  # The application ID of the gl-cicd service principal. An identifier, not a secret:
+  # CI signs in with GitHub OIDC, so no credential for it exists anywhere.
+  cicd_sp:
+    description: Application ID of the service principal that CI deploys as
+    default: c704f004-3511-4548-ba8d-691923b5f1f4
 
 targets:
+  # One shared dev deployment. CI deploys dev as gl-cicd on every merge to main, and
+  # Anuj deploys from a laptop. A table belongs to exactly one pipeline, so both have to
+  # update the same deployment: the state lives in gl-cicd's home folder instead of each
+  # deployer's, and gl_engineers (both identities) can manage every resource. Not
+  # /Workspace/Shared: every workspace user can write there, and so could change the
+  # code a dev job runs.
+  # Nothing sets run_as, so runs keep the identity that owns each resource.
+  #
+  # `mode: development` refuses a root_path outside the deployer's own folder, so dev uses presets for the parts
+  # of development mode it needs: a fixed name prefix and pipelines in development
+  # mode. Schedules are already paused through schedule_pause. Unlike development mode,
+  # this keeps the deployment lock, so a CI deploy and a laptop deploy cannot overlap.
   dev:
-    mode: development
     default: true
     workspace:
       profile: gl-dev
+      root_path: /Workspace/Users/${var.cicd_sp}/.bundle/${bundle.name}/${bundle.target}
+    presets:
+      name_prefix: "[dev] "
+      pipelines_development: true
+    permissions:
+      - level: CAN_MANAGE
+        group_name: gl_engineers
+      # Already the owner of its home folder. Listed so the bundle states it.
+      - level: CAN_MANAGE
+        service_principal_name: ${var.cicd_sp}
     variables:
       env: dev
 
+  # Prod is deployed only by CI, as gl-cicd, on a version tag, and everything runs as
+  # gl-cicd. So prod does not depend on any person's account, and nobody needs to hold
+  # write access to prod tables day to day.
   prod:
     mode: production
     workspace:
       profile: gl-prod
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    run_as:
+      service_principal_name: ${var.cicd_sp}
     variables:
       env: prod

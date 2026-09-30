@@ -32,6 +32,11 @@ QUARANTINE = f"{CATALOG}.silver.quarantine_events"
 # landing and the next scheduled run, or for a backfill. Seven days covers both.
 TOMBSTONE_RETENTION_SECONDS = str(7 * 24 * 3600)
 
+# "auto" leaves file size to Databricks, which targets 256 MB for a table this small, so
+# journal_entries is one file. The clustering experiment in docs/results.md sets 1mb to
+# spread it over enough files for data skipping to show.
+JOURNAL_TARGET_FILE_SIZE = spark.conf.get("gl.journal_target_file_size")
+
 
 def define_events(table: str) -> None:
     @dp.temporary_view(name=f"{table}_parsed")
@@ -61,9 +66,11 @@ def define_events(table: str) -> None:
         return cdc.rejected(spark.readStream.table(f"{table}_checked"), table)
 
 
-def define_cdc_target(table: str, target: str, scd_type: int, properties: dict) -> None:
+def define_cdc_target(
+    table: str, target: str, scd_type: int, properties: dict, cluster_by: list | None = None
+) -> None:
     name = f"{CATALOG}.silver.{target}"
-    dp.create_streaming_table(name=name, table_properties=properties)
+    dp.create_streaming_table(name=name, table_properties=properties, cluster_by=cluster_by)
     dp.create_auto_cdc_flow(
         target=name,
         source=f"{table}_valid",
@@ -87,4 +94,16 @@ for _table in cdc.TABLES:
 
 define_cdc_target("accounts", "accounts", 1, tombstones)
 define_cdc_target("accounts", "account_history", 2, {})
-define_cdc_target("journal_entries", "journal_entries", 1, tombstones)
+journal_properties = dict(tombstones)
+if JOURNAL_TARGET_FILE_SIZE != "auto":
+    journal_properties["delta.targetFileSize"] = JOURNAL_TARGET_FILE_SIZE
+
+# Liquid clustering on the columns reads filter by: one account's lines, one day's lines.
+# Gold scans the whole table, so it gains nothing. See docs/results.md for the numbers.
+define_cdc_target(
+    "journal_entries",
+    "journal_entries",
+    1,
+    journal_properties,
+    cluster_by=["account_id", "entry_date"],
+)

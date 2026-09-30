@@ -1,0 +1,28 @@
+# Merge to main: deploy the bundle to dev. Nothing is run; a deploy starts no compute.
+name: deploy-dev
+
+on:
+  push:
+    branches: [main]
+
+# One deploy at a time. The bundle's deployment lock would refuse the second anyway.
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DATABRICKS_AUTH_TYPE: github-oidc
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+      BUNDLE_VAR_alert_email: ${{ secrets.BUNDLE_VAR_ALERT_EMAIL }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: databricks/setup-cli@v1.8.0
+      - run: databricks bundle deploy -t dev

@@ -188,3 +188,49 @@ both cases. A follow-up replay, run 2 hours 48 minutes after the full refresh an
 two rounds of new data, did reach AUTO CDC: the rejected reason counts rose by exactly
 the older files' rejected events. Silver and gold were unchanged, so AUTO CDC ignores
 a (key, lsn) it has already applied. The results are in ARCHITECTURE.md.
+
+## Shared dev deployment planned under development mode
+
+**Produced:** the checkpoint 6 plan, which proposed a shared `root_path` for the dev
+target so that CI (as `gl-cicd`) and Anuj's laptop deploy the same dev pipeline and
+jobs, while keeping `mode: development`.
+
+**Wrong:** development mode refuses that. It requires the root path to be under `~/`
+or to contain the deployer's user name, and the name prefix to contain the deployer's
+short name. Both exist so that two people never share one development deployment,
+which is exactly what the plan wanted.
+
+**Caught by:** `databricks bundle validate -t dev`, before anything was deployed:
+`root_path must start with '~/' or contain the current username to ensure uniqueness
+when using 'mode: development'`.
+
+**Fix:** the dev target drops `mode: development` and sets the presets it needs:
+`name_prefix: "[dev] "` and `pipelines_development: true`. Schedules were already
+paused through `schedule_pause`. The state moved to `gl-cicd`'s home folder rather
+than `/Workspace/Shared`, which validate flagged as writable by every workspace user.
+
+## SCD2 reference opened a version for every event
+
+**Produced:** `expected_scd2` in `src/transforms/cdc.py`, the reference history that
+`silver_state_check` compares `silver.account_history` against. Every non-delete event
+opened a version, and the next event closed it.
+
+**Wrong:** two cases AUTO CDC handles differently, neither of which the checkpoint 2 to
+5 runs (about 500 events) happened to contain:
+
+- An update whose values equal the open version's. AUTO CDC opens a version only when a
+  tracked column changes, so it keeps one version where the reference had two.
+- A second delete in a row for the same key. AUTO CDC writes a closed row from the
+  delete's before image with a NULL `__START_AT`. The reference wrote nothing.
+
+**Caught by:** `silver_state_check` after the first full refresh on the checkpoint 6
+medium dataset (1.1M events): `silver.account_history expected=215015 actual=214556
+missing=940 extra=481`. A one-off diagnostic printed the events and both histories for
+the differing keys. After the first fix, 14 extra rows remained, each on a key with two
+deletes in a row.
+
+**Fix:** unit tests for both cases in `tests/unit/test_scd2.py`, then the reference drops
+unchanged updates and writes the repeated delete row. The pipeline was not changed; it
+was right. After the fix, `silver_state_check` passed: 214,556 rows, 0 missing, 0 extra.
+The repeated delete behavior is observed, not documented, so the reference models only
+the case that occurred.
