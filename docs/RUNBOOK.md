@@ -203,9 +203,13 @@ A deploy starts no compute. Schedules stay paused unless `schedule_pause` is set
 
 ### A deploy failed
 
-- **Authentication error** (`github-oidc`, 401 or 403): check the federation policy
-  subject matches the job's environment exactly, and that the repository variables
-  `DATABRICKS_HOST` and `DATABRICKS_CLIENT_ID` are set.
+- **`cannot configure default credentials`:** the profiles step did not run or a
+  repository variable is empty. It needs `DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID` and
+  `DATABRICKS_TOKEN_AUDIENCE`.
+- **Token exchange refused** (401 or 403 from `github-oidc`): the token does not match
+  the federation policy. The policy subject must match the job's environment exactly
+  (`repo:anjmhrjn/gl-cdc-lakehouse:environment:dev` or `...:prod`), and its audience
+  must equal `DATABRICKS_TOKEN_AUDIENCE`.
 - **Deployment lock held:** another deploy of the same target is running, or one
   crashed. Wait for it. If it crashed, deploy once with `--force-lock` from a laptop.
 - **Validation error:** fix it in a pull request. `pr.yml` runs the same validation.

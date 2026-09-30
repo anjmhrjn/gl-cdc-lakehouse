@@ -234,3 +234,31 @@ unchanged updates and writes the repeated delete row. The pipeline was not chang
 was right. After the fix, `silver_state_check` passed: 214,556 rows, 0 missing, 0 extra.
 The repeated delete behavior is observed, not documented, so the reference models only
 the case that occurred.
+
+## CI workflows authenticated only through environment variables
+
+**Produced:** the checkpoint 6 workflows set `DATABRICKS_AUTH_TYPE: github-oidc`,
+`DATABRICKS_HOST` and `DATABRICKS_CLIENT_ID` as environment variables, as in the
+Databricks GitHub Actions example. Before pushing, I had simulated CI only with a
+dummy token, which confirmed that the CLI falls back to environment variables when
+the `gl-dev` profile is missing, but not which auth type it then uses.
+
+**Wrong:** two things.
+
+- `databricks.yml` names a profile for each target. With a profile named, CLI 1.8.0
+  ignores `DATABRICKS_AUTH_TYPE` from the environment, so no auth method was chosen.
+- Even with the auth type fixed, the CLI requests the GitHub token with the workspace
+  token endpoint as audience. The federation policy expects the account ID, so the
+  exchange would have been refused next.
+
+**Caught by:** the first pull request. `validate` failed with `default auth: cannot
+configure default credentials`, and the config it printed had `profile=gl-dev` and no
+auth type. A local run with the same variables reproduced it inside the repo but not
+outside it. The audience was found in the same local runs: the failed token request
+URL ended in `audience=https://<workspace>/oidc/v1/token`. The Go SDK's
+`determineAudience` confirmed the default.
+
+**Fix:** `.github/scripts/databricks-profiles.sh` writes the `gl-dev` and `gl-prod`
+profiles on the runner with `auth_type = github-oidc`, `client_id` and `audience`, from
+repository variables. Checked locally with a fake token URL: both targets now request
+the token through `github-oidc` with the configured audience.

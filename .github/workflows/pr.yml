@@ -30,12 +30,14 @@ jobs:
       contents: read
       id-token: write
     env:
-      DATABRICKS_AUTH_TYPE: github-oidc
-      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
-      DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
       BUNDLE_VAR_alert_email: ${{ secrets.BUNDLE_VAR_ALERT_EMAIL }}
     steps:
       - uses: actions/checkout@v7
       - uses: databricks/setup-cli@v1.8.0
+      - run: .github/scripts/databricks-profiles.sh
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_TOKEN_AUDIENCE: ${{ vars.DATABRICKS_TOKEN_AUDIENCE }}
       - run: databricks bundle validate -t dev
       - run: databricks bundle validate -t prod

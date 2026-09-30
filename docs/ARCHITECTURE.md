@@ -912,6 +912,15 @@ token federation (`DATABRICKS_AUTH_TYPE: github-oidc`). GitHub issues a short-li
 token per job, and Databricks exchanges it because a federation policy on `gl-cicd`
 trusts it. So there is no Databricks secret anywhere, in GitHub or elsewhere.
 
+`databricks.yml` names a profile per target (`gl-dev`, `gl-prod`) for laptop use. With a
+profile named, CLI 1.8.0 ignores `DATABRICKS_AUTH_TYPE` from the environment, so
+environment variables alone fail in CI. Each workflow runs
+`.github/scripts/databricks-profiles.sh` first, which writes both profiles into the
+runner's `~/.databrickscfg` with `auth_type = github-oidc`. The profiles also set
+`audience` to the account ID, the audience the federation policies accept. Without it,
+the CLI asks GitHub for a token whose audience is the workspace token endpoint (read
+from the SDK source, `determineAudience`), and the exchange would be refused.
+
 The policies trust GitHub environments, not branches:
 
 - `repo:anjmhrjn/gl-cdc-lakehouse:environment:dev` for PR validation and the deploy on
