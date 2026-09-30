@@ -162,3 +162,29 @@ also reads two of them directly as the test user.
 `ALTER FUNCTION ... OWNER TO`, which I could not find in the SQL reference when I
 checked. I replaced it with `GRANT EXECUTE` before handing the files over, so no run
 caught it.
+
+## Predicted that a range replay would reach AUTO CDC
+
+**Produced:** the checkpoint 5 design for `backfill_replay` range mode. ARCHITECTURE.md
+and RUNBOOK.md said the silver dedupe "only covers an hour of ingest", so re-delivered
+copies would get through it and reach AUTO CDC, and every rejected event would get a
+second row in `quarantine_events`. The dev replay was meant to settle what AUTO CDC
+does with a (key, lsn) it has already applied.
+
+**Wrong:** I treated the one hour watermark as wall-clock time. It advances with the
+`_ingested_at` of new data. In the dev run the originals had been ingested less than an
+hour before the newest data, so the dedupe still held their state and dropped the
+copies. The copies never reached AUTO CDC, and the question the run was meant to
+answer is still open.
+
+**Caught by:** the quarantine reason counts in `silver_state_check`, pasted back by
+Anuj. After the replay `unparseable_payload` went from 1 to 2, while `amount_positive`
+and `currency_known` did not change. Unparseable lines skip the dedupe and rejected
+events go through it, so only the dedupe explains the difference. The silver and gold
+checksums were unchanged, which on its own would have looked like a full pass.
+
+**Fix:** ARCHITECTURE.md, RUNBOOK.md and the `silver_state_check` comment now describe
+both cases. A follow-up replay, run 2 hours 48 minutes after the full refresh and after
+two rounds of new data, did reach AUTO CDC: the rejected reason counts rose by exactly
+the older files' rejected events. Silver and gold were unchanged, so AUTO CDC ignores
+a (key, lsn) it has already applied. The results are in ARCHITECTURE.md.

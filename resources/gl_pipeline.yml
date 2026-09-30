@@ -7,8 +7,16 @@ resources:
       # pipeline can publish to bronze, silver and gold.
       schema: silver
       serverless: true
-      # Never continuous. Dev is triggered by hand; prod gets a schedule in checkpoint 5.
+      # Never continuous. Dev is triggered by hand; the gl_pipeline_scheduled job runs
+      # it on a schedule (resources/reliability.yml).
       continuous: false
+      notifications:
+        - email_recipients:
+            - ${var.alert_email}
+          alerts:
+            - on-update-failure
+            - on-update-fatal-failure
+            - on-flow-failure
       channel: CURRENT
       # src/ goes on sys.path, so pipeline files import `transforms.cdc` exactly as the
       # unit tests do.

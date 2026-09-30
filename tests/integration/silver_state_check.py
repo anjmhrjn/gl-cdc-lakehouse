@@ -20,6 +20,13 @@ from pyspark.sql import functions as F
 # quarantine comparison and checksum.
 QUARANTINE_COMPARED = ["source_table", "reasons", "payload", "_op", "_lsn"]
 
+# quarantine_events is a log of deliveries. A re-delivered unparseable line always adds
+# a row, since it skips the dedupe, and a re-delivered rejected event adds one once the
+# stream dedupe no longer holds its original. Silver and gold must not change, but the
+# quarantine row count legitimately does, so quarantine is compared as a set of
+# distinct rows.
+SET_COMPARED = {"silver.quarantine_events"}
+
 
 def checksum(df: DataFrame) -> int:
     """Sum of per-row hashes. Independent of row order and file layout."""
@@ -82,6 +89,8 @@ def main() -> int:
     failed = []
     for name, want in expected.items():
         got = spark.table(f"{args.catalog}.{name}").select(*want.columns)
+        if name in SET_COMPARED:
+            want, got = want.distinct(), got.distinct()
         if not compare(name, want, got):
             failed.append(name)
 

@@ -1,0 +1,158 @@
+# Scheduled runs, the freshness and trial balance checks, and backfill/replay.
+#
+# Retries: only tasks that can fail for a transient reason retry, up to 2 times. The
+# Jobs API retries at a fixed interval, so a minute apart is the closest it gets to
+# backoff. The checks fail on data, and retrying them would only repeat the alert
+# later, so they never retry. The replay task copies files, so it is not retried
+# blindly either; RUNBOOK.md says how to re-run it.
+resources:
+  jobs:
+    gl_pipeline_scheduled:
+      name: gl_pipeline_scheduled_${var.env}
+      description: Runs gl_pipeline every 30 minutes, then trial_balance_check.
+      # Every 30 minutes keeps gold within the 60 minute freshness SLA: a file that
+      # lands just after an update starts waits at most 30 minutes plus one update.
+      schedule:
+        quartz_cron_expression: "0 0/30 * * * ?"
+        timezone_id: UTC
+        pause_status: ${var.schedule_pause}
+      max_concurrent_runs: 1
+      email_notifications:
+        on_failure:
+          - ${var.alert_email}
+      tasks:
+        - task_key: pipeline
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.gl_pipeline.id}
+          max_retries: 2
+          min_retry_interval_millis: 60000
+          retry_on_timeout: false
+        - task_key: trial_balance
+          depends_on:
+            - task_key: pipeline
+          run_job_task:
+            job_id: ${resources.jobs.trial_balance_check.id}
+
+    trial_balance_check:
+      name: trial_balance_check_${var.env}
+      description: Fails if debits and credits do not net to zero per business unit, currency and entry date.
+      parameters:
+        - name: max_orphan_hours
+          default: "48"
+      email_notifications:
+        on_failure:
+          - ${var.alert_email}
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "5"
+      tasks:
+        - task_key: check
+          environment_key: default
+          max_retries: 0
+          spark_python_task:
+            python_file: ../src/jobs/trial_balance_check.py
+            parameters:
+              - --catalog
+              - ${var.catalog}
+              - --src
+              - ${workspace.file_path}/src
+              - --max-orphan-hours
+              - "{{job.parameters.max_orphan_hours}}"
+
+    freshness_check:
+      name: freshness_check_${var.env}
+      description: Fails if gold.daily_trial_balance has not refreshed within the SLA of a file landing.
+      # Offset from the pipeline schedule so a check does not start at the same second
+      # as the update it is judging.
+      schedule:
+        quartz_cron_expression: "0 5/15 * * * ?"
+        timezone_id: UTC
+        pause_status: ${var.schedule_pause}
+      max_concurrent_runs: 1
+      parameters:
+        - name: sla_minutes
+          default: "60"
+      email_notifications:
+        on_failure:
+          - ${var.alert_email}
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "5"
+      tasks:
+        - task_key: check
+          environment_key: default
+          max_retries: 0
+          spark_python_task:
+            python_file: ../src/jobs/freshness_check.py
+            parameters:
+              - --catalog
+              - ${var.catalog}
+              - --landing-root
+              - ${var.landing_root}
+              - --pipeline-id
+              - ${resources.pipelines.gl_pipeline.id}
+              - --src
+              - ${workspace.file_path}/src
+              - --sla-minutes
+              - "{{job.parameters.sla_minutes}}"
+
+    backfill_replay:
+      name: backfill_replay_${var.env}
+      description: Re-delivers landing files for a dt range, or full-refreshes tables, then reapplies governance and checks it. See docs/RUNBOOK.md.
+      max_concurrent_runs: 1
+      timeout_seconds: 7200
+      parameters:
+        - name: mode
+          default: range
+        - name: from
+          default: ""
+        - name: to
+          default: ""
+        - name: tables
+          default: ""
+      email_notifications:
+        on_failure:
+          - ${var.alert_email}
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "5"
+      tasks:
+        - task_key: replay
+          environment_key: default
+          max_retries: 0
+          spark_python_task:
+            python_file: ../src/jobs/backfill_replay.py
+            parameters:
+              - --catalog
+              - ${var.catalog}
+              - --landing-root
+              - ${var.landing_root}
+              - --pipeline-id
+              - ${resources.pipelines.gl_pipeline.id}
+              - --src
+              - ${workspace.file_path}/src
+              - --run-id
+              - "{{job.run_id}}"
+              - --mode
+              - "{{job.parameters.mode}}"
+              - --from
+              - "{{job.parameters.from}}"
+              - --to
+              - "{{job.parameters.to}}"
+              - --tables
+              - "{{job.parameters.tables}}"
+        # A full refresh may recreate tables without their masks and filters, so
+        # governance is reapplied after every replay and then verified.
+        - task_key: governance
+          depends_on:
+            - task_key: replay
+          run_job_task:
+            job_id: ${resources.jobs.governance.id}
+        - task_key: governance_check
+          depends_on:
+            - task_key: governance
+          run_job_task:
+            job_id: ${resources.jobs.governance_check.id}

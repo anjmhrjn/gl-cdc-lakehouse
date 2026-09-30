@@ -17,6 +17,16 @@ variables:
   landing_root:
     description: Landing prefix for this environment, covered by the gl_<env>_landing location
     default: s3://${var.landing_bucket}/${var.env}/cdc
+  # No default, so the address never lands in the repo. Set it per shell with
+  # `export BUNDLE_VAR_alert_email=...`, and as a secret in CI.
+  alert_email:
+    description: Address that receives pipeline and job failure emails
+  # Paused by default: an idle prod still bills every scheduled serverless update.
+  # Unpause with `--var schedule_pause=UNPAUSED` on deploy. Development mode pauses
+  # schedules in dev regardless.
+  schedule_pause:
+    description: PAUSED or UNPAUSED, for every schedule in this bundle
+    default: PAUSED
 
 targets:
   dev:

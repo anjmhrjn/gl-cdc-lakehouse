@@ -662,3 +662,241 @@ from the run above.
   confirms what the effective permissions API reported.
 
 Still to do: a full refresh, in checkpoint 5, to see whether `ALTER`-set masks survive it.
+(Answered in checkpoint 5: they do. See "Verified on dev" there.)
+
+## Checkpoint 5: Reliability
+
+### Scheduling lives in a job, paused by default
+
+A pipeline has no schedule of its own. `gl_pipeline_scheduled` runs it every 30 minutes
+and then runs `trial_balance_check`. Thirty minutes is what the freshness SLA needs: a
+file that lands just after an update starts waits for the next one, so its worst case
+is 30 minutes plus one update. Hourly could not hold 60 minutes.
+
+Every schedule reads `var.schedule_pause`, which defaults to `PAUSED`. An unpaused prod
+runs 48 pipeline updates and 96 freshness checks a day on serverless compute, even with
+nothing landing. For a portfolio project that cost is only worth paying during a demo.
+
+### Alerts are job and pipeline emails
+
+Jobs set `email_notifications.on_failure`. The pipeline sets `notifications` for
+`on-update-failure`, `on-update-fatal-failure` and `on-flow-failure`. All of them send to
+`var.alert_email`, which has no default, so the address is never committed. It comes
+from `BUNDLE_VAR_alert_email` locally and from a secret in CI.
+
+### Retries
+
+| Task | Retries | Why |
+|---|---|---|
+| scheduled pipeline update | 2, a minute apart | failures here are infrastructure; data problems are dropped or quarantined, never raised |
+| governance | 2, a minute apart | every statement is idempotent |
+| trial_balance_check, freshness_check | 0 | they fail on data; a retry repeats the same answer later |
+| backfill_replay | 0 | it copies files and starts updates; a blind retry would re-deliver again |
+
+The Jobs API retries at a fixed interval (`min_retry_interval_millis`), so there is no
+true backoff. A minute apart is the closest it gets.
+
+### trial_balance_check tolerates late accounts, for a while
+
+The data quality rules make an orphan journal line warn-only, and the trial balance
+check is fail-and-alert. A late account triggers both: its lines sit under a NULL
+business_unit, and its real unit is short by the same amount. Failing on that would
+alert on every late account, and the alert would soon be ignored.
+
+So a gap counts as explained when both of these hold:
+
+- a NULL-unit group exists for the same currency and entry date, and
+- all groups for that currency and date net to zero together.
+
+The second condition alone is not enough. Two real units that are off in opposite
+directions also sum to zero, which is what a journal crossing units looks like, and
+that has to fail. A unit test covers exactly this case.
+
+An explained gap is tolerated only while every orphan line is younger than
+`max_orphan_hours` (48, the generator's maximum lateness). Age comes from `posted_at`,
+the source time, not `_ingested_at`, because a full refresh resets ingest time and
+would make an old orphan look new. A line whose `posted_at` failed to parse has no age,
+so it counts as stale.
+
+### freshness_check measures the oldest file gold has not seen
+
+A landing file is covered once a completed pipeline update that refreshed gold started
+after the file landed. The lag is the age of the oldest file not covered. Two details:
+
+- Landing time is the S3 modification time, not the `dt=`/`hh=` partition, which the
+  generator names after simulated time.
+- Refresh times come from the Pipelines API (`list_updates`), because a materialized
+  view has no table history. An update counts if it completed, was not validate-only,
+  and either refreshed the whole graph or named `daily_trial_balance` in a selection.
+
+A file that landed at the same instant an update started is treated as not covered.
+The update lists files some time after it starts, so the check cannot know whether that
+file made it in.
+
+### Date-range replay is a re-delivery
+
+Auto Loader never reads a path twice, so a date range cannot be "reprocessed" in place.
+`backfill_replay` in range mode copies the original files for the range into the
+current partition as `replay-<job run id>-<name>`. A copy is a new delivery, so it
+follows the landing-time partition rule, and it carries events silver has already
+applied.
+
+Whether the copies reach AUTO CDC depends on the silver dedupe. It keys on (key, lsn)
+with a one hour watermark on `_ingested_at`. The watermark moves with the ingest time
+of new data, not with the clock. So a copy is dropped as a duplicate while the stream
+still holds state for its original, and reaches AUTO CDC once newer data has pushed the
+watermark past it. In prod, where data lands all the time, replaying yesterday is the
+second case. The docs do not say what AUTO CDC does with a sequence value it has
+already applied, for SCD1 or SCD2. The follow-up test on dev showed that it ignores
+them: no row changed and `account_history` gained no versions (see "Verified on dev").
+
+A range may start at most 5 days back (`REPLAY_MAX_AGE_DAYS`). The SCD1 tables keep
+delete tombstones for 7 days. A file landed on the first day of the range holds events
+up to 48 hours older, and any delete that supersedes one of them came later, so 5 days
+keeps every such delete inside the tombstone window. Past that, a re-delivered create
+for a deleted key would put the row back. Older ranges need a full refresh, which
+replays the deletes too.
+
+`quarantine_events` is an append-only log of deliveries, so a replay can add rows:
+
+- An unparseable line skips the dedupe (it has no key), so every delivery of it becomes
+  a row, in a replay and in a full refresh alike.
+- A rejected event goes through the dedupe, so it gets a second row only when its copy
+  gets past the dedupe, as described above.
+
+Silver and gold must not change either way, but the quarantine row count can.
+`silver_state_check` therefore compares quarantine as a set of distinct rows.
+
+### Full refresh goes through the SDK
+
+`pipeline_task` in a job accepts `full_refresh_selection`, but only as a fixed list in
+the YAML. The backfill job needs the table list as a run parameter, so its Python task
+calls `pipelines.start_update(full_refresh_selection=...)` from the Databricks SDK,
+which serverless environment 5 ships (0.67.0). After a selective refresh it runs a
+normal update so gold catches up.
+
+Bronze can only be reset together with everything else (`tables=all`). The silver
+streams read bronze from a checkpoint, and resetting bronze alone breaks that
+checkpoint.
+
+Every backfill run ends with the `governance` job and `governance_check`. This answers
+the checkpoint 4 question the safe way: whether or not a full refresh keeps masks set
+with `ALTER`, they are back before the job reports success.
+
+### Deferred
+
+The `maintenance` job (OPTIMIZE and VACUUM) moves to checkpoint 6, next to the
+compaction experiment that needs its before and after numbers.
+
+### Verified on dev
+
+Run on 2026-09-30 by Anuj, from a cleared landing prefix
+(`s3://gl-cdc-lakehouse-anuj/dev/cdc/`), with generator seed 42 throughout.
+
+**Masks survive a full refresh.** After the generator run with
+`--withhold-late-accounts` and `gl_pipeline --full-refresh-all`, `governance_check`
+passed before the governance job had been run again: 8 classifications, 11 masks with
+pii tags, 4 row filters, no `ALL PRIVILEGES`. That answers the checkpoint 4 question.
+Masks and filters set with `ALTER` stay on the tables through a full refresh.
+`backfill_replay` still reapplies governance after every run, as a guard that costs
+little.
+
+**trial_balance_check.**
+
+| Run | State | Result |
+|---|---|---|
+| 1 | three accounts withheld | warn: 0 unexplained groups, 10 explained by late accounts, 0 stale orphans |
+| 2 | same, `max_orphan_hours=0` | fail, failure email received |
+| 3 | after `--only-late-accounts` and an update | pass: 0 unexplained, 0 explained, 0 stale |
+
+The 10 explained groups match checkpoint 3's second run: 5 NULL-unit groups and the 5
+real unit groups short by the same amounts.
+
+**freshness_check.**
+
+| Run | State | Result |
+|---|---|---|
+| 1 | a `--minutes 2` generator run, no update, `sla_minutes=1` after 2 minutes | fail, failure email received |
+| 2 | after an update | pass: gold refreshed at 15:02:43, newest file 14:57:51, 25 files, all covered |
+
+25 files is every file the three generator runs wrote: 20 from the withhold run, 1
+from the late account run and 4 from the two minute run. So the partition listing
+found them all.
+
+**Re-runs give identical tables.** `silver_state_check` after each step:
+
+| Step | Result |
+|---|---|
+| A: before any replay | baseline |
+| `backfill_replay mode=range`, today | same as A |
+| `backfill_replay mode=refresh tables=all` | same as A |
+| `backfill_replay mode=refresh tables=silver.account_history gold.daily_trial_balance` | same as A |
+
+| Table | Rows | Checksum in all four checks |
+|---|---|---|
+| silver.accounts | 202 | -32674477543491858157 |
+| silver.account_history | 494 | -199019209967747125591 |
+| silver.journal_entries | 500 | 125848035505143635455 |
+| silver.quarantine_events (distinct) | 4 | -12747277404367413034 |
+| gold.account_balances | 158 | 60358885540008367057 |
+| gold.daily_trial_balance | 32 | 8092906349789054787 |
+
+Every table had 0 missing and 0 extra in all four checks. The selective refresh also
+showed that `full_refresh_selection` accepts fully qualified table names.
+
+**What the range replay did and did not prove.** The quarantine reasons after the
+replay show what happened to the copies:
+
+| Reason | Before replay | After replay | After refresh all |
+|---|---|---|---|
+| journal_entries unparseable_payload | 1 | 2 | 2 |
+| journal_entries amount_positive | 2 | 2 | 2 |
+| journal_entries currency_known | 2 | 2 | 2 |
+| accounts currency_known | 1 | 1 | 1 |
+
+The unparseable line, which skips the dedupe, was delivered twice and has two rows.
+The rejected events, which go through the dedupe, did not gain rows. So the stream
+dedupe dropped the copies. The originals had been ingested less than an hour before the
+newest data, so their dedupe state was still held. The parseable copies therefore never
+reached AUTO CDC either.
+
+This replay proved that a re-delivery within the dedupe window changes nothing. It did
+not prove what AUTO CDC does with a (key, lsn) it has already applied, which is the
+prod case: a replay of yesterday arrives long after the dedupe state is gone.
+
+**Follow-up: a replay that reaches AUTO CDC.** Run on 2026-09-30 by Claude, with
+Anuj's go-ahead. The full refresh above ran at 16:45 UTC, so every bronze row carried
+that ingest time. At 19:33, 2 hours 48 minutes later, two rounds of generator run
+(`--minutes 5 --rate 50`) plus pipeline update moved the watermark forward. The second
+round is the batch that drops the old dedupe state. Then `silver_state_check` (B),
+`backfill_replay mode=range` for 2026-09-30 (45 files: 25 from the earlier runs, 20
+from the two new ones), and `silver_state_check` again.
+
+| Table | Rows | Checksum, before and after the replay |
+|---|---|---|
+| silver.accounts | 204 | -54853975852352771414 |
+| silver.account_history | 972 | -179194947190516409550 |
+| silver.journal_entries | 938 | 3662668268929214105 |
+| silver.quarantine_events (distinct) | 6 | -6573608045740639676 |
+| gold.account_balances | 165 | 167976281022534743441 |
+| gold.daily_trial_balance | 33 | -51461890706856751947 |
+
+| Reason | Before replay | After replay |
+|---|---|---|
+| accounts currency_known | 1 | 2 |
+| journal_entries amount_positive | 4 | 6 |
+| journal_entries currency_known | 4 | 6 |
+| journal_entries unparseable_payload | 2 | 3 |
+
+- **The copies got past the dedupe this time.** The rejected reasons rose by exactly
+  the rejected events of the 25 older files (1, 2 and 2). The copies of the two new
+  runs, ingested minutes before, were still dropped. Valid events leave the same
+  deduplicated view as rejected ones, so the valid copies of the older files reached
+  AUTO CDC.
+- **AUTO CDC ignores a (key, lsn) it has already applied, for SCD1 and SCD2.** Every
+  silver and gold checksum is unchanged, and `account_history` has the same 972
+  versions. So a replay long after the original delivery leaves silver and gold
+  identical, which is the prod case the replay job exists for.
+- This rests on one assumption: the AUTO CDC flows had dropped their dedupe state just
+  as the quarantine flow had. Each flow keeps its own state, but they read the same
+  bronze rows in the same updates, so their watermarks move together.
