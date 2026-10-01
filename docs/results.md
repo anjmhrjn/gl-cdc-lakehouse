@@ -234,8 +234,9 @@ only: billing covers the whole account, and the CI identity has no need for it. 
 the experiments the query was a `tuning_probe` mode, which worked while jobs ran as
 Anuj and failed with `INSUFFICIENT_PERMISSIONS` once they ran as `gl-cicd`.
 
-Billing records arrive hours after the usage. When this was written the newest record
-was from 16:50 UTC, so the experiment runs (21:03 to 22:01 UTC) were not in yet.
+Billing records arrive hours after the usage. The experiment runs (21:03 to 22:01 UTC
+on 2026-09-30) were not in billing on the evening they ran; their figures below were
+read once they had arrived.
 
 **Checkpoint 2 to 5 pipeline updates** (about 500 journal events per run), 17 updates on
 2026-09-29 and 2026-09-30:
@@ -278,7 +279,7 @@ took ownership, so they are found with that pipeline's old id
 (`75bb9baf-ffe1-49e4-8869-28c924a7057e`) as `:pipeline_id`.
 
 The first prod update (44944bdb-f3f8-493e-97bf-49ceae69574d, 2026-10-01 15:19 UTC) was
-not in billing yet when this was written.
+not in billing yet as of 2026-10-01.
 
 **What an unpaused prod would cost:** the schedule makes 48 pipeline updates a day. At
 the checkpoint 2 to 5 figure of about 0.10 USD each that is about 4.80 USD a day, before

@@ -1,7 +1,30 @@
 # Architecture
 
-This file records decisions that are not obvious from reading the code. The overall
-shape of the project is in `CLAUDE.md`.
+This file records decisions that are not obvious from reading the code, in the order
+they were made, with what was verified at each checkpoint. The scope and data contract
+are in `CLAUDE.md`.
+
+## Overview
+
+Synthetic Debezium-format events for two tables, `accounts` and `journal_entries`, land
+in S3. One pipeline, `gl_pipeline`, reads them into bronze with Auto Loader, applies
+them to silver with AUTO CDC sequenced by `source.lsn`, and builds two gold
+materialized views. Jobs around the pipeline schedule it, check freshness and the trial
+balance, replay or full-refresh on request, and apply governance. Terraform owns the AWS
+and Unity Catalog resources; the Asset Bundle owns the pipeline and jobs, and CI
+deploys it as the `gl-cicd` service principal. The README has the diagram.
+
+Contents:
+
+- [Checkpoint 1: Terraform and generator](#checkpoint-1-terraform-and-generator), and
+  the [generator](#generator)
+- [Checkpoint 2: Bronze and silver CDC](#checkpoint-2-bronze-and-silver-cdc)
+- [Checkpoint 3: Quality and gold](#checkpoint-3-quality-and-gold)
+- [Checkpoint 4: Governance](#checkpoint-4-governance)
+- [Checkpoint 5: Reliability](#checkpoint-5-reliability)
+- [Checkpoint 6: Tuning, cost, CI/CD](#checkpoint-6-tuning-cost-cicd)
+
+Tuning and cost numbers are in `docs/results.md`, operating steps in `docs/RUNBOOK.md`.
 
 ## Checkpoint 1: Terraform and generator
 
@@ -498,7 +521,8 @@ The cost: when the pipeline creates a table, the table is unprotected until the
 governance job runs. On dev that window is accepted. The `backfill_replay` job in
 checkpoint 5 runs governance after any full refresh. It is still unconfirmed whether a
 full refresh keeps `ALTER`-set masks. That run will show it, and `governance_check`
-fails if they are gone.
+fails if they are gone. (Answered in checkpoint 5: they are kept. See "Verified on dev"
+there.)
 
 ### The pipeline owner must be in gl_pii_readers and gl_engineers
 
