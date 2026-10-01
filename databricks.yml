@@ -43,29 +43,50 @@ targets:
   # One shared dev deployment. CI deploys dev as gl-cicd on every merge to main, and
   # Anuj deploys from a laptop. A table belongs to exactly one pipeline, so both have to
   # update the same deployment: the state lives in gl-cicd's home folder instead of each
-  # deployer's, and gl_engineers (both identities) can manage every resource. Not
-  # /Workspace/Shared: every workspace user can write there, and so could change the
-  # code a dev job runs.
-  # Nothing sets run_as, so runs keep the identity that owns each resource.
+  # deployer's. Not /Workspace/Shared: every workspace user can write there, and so
+  # could change the code a dev job runs.
   #
-  # `mode: development` refuses a root_path outside the deployer's own folder, so dev uses presets for the parts
-  # of development mode it needs: a fixed name prefix and pipelines in development
-  # mode. Schedules are already paused through schedule_pause. Unlike development mode,
-  # this keeps the deployment lock, so a CI deploy and a laptop deploy cannot overlap.
+  # gl-cicd owns and runs everything, as in prod. Without an explicit IS_OWNER the CLI
+  # makes whoever deploys the owner, so ownership would flip between deployers, and
+  # only a workspace admin may change a job's owner. With one named, the deployer gets
+  # CAN_MANAGE instead. IS_OWNER is only accepted per resource, so every job and the
+  # pipeline is listed under resources below. A new job must be added there, or CI's
+  # deploy fails on it with 403 PERMISSION_DENIED.
+  #
+  # `mode: development` refuses a root_path outside the deployer's own folder, so dev
+  # uses presets for the parts of development mode it needs: a fixed name prefix and
+  # pipelines in development mode. Schedules are already paused through
+  # schedule_pause. Unlike development mode, this keeps the deployment lock, so a CI
+  # deploy and a laptop deploy cannot overlap.
   dev:
     default: true
     workspace:
       profile: gl-dev
       root_path: /Workspace/Users/${var.cicd_sp}/.bundle/${bundle.name}/${bundle.target}
+    run_as:
+      service_principal_name: ${var.cicd_sp}
     presets:
       name_prefix: "[dev] "
       pipelines_development: true
     permissions:
       - level: CAN_MANAGE
         group_name: gl_engineers
-      # Already the owner of its home folder. Listed so the bundle states it.
-      - level: CAN_MANAGE
-        service_principal_name: ${var.cicd_sp}
+    resources:
+      pipelines:
+        gl_pipeline:
+          permissions: &cicd_owner
+            - level: IS_OWNER
+              service_principal_name: ${var.cicd_sp}
+      jobs:
+        backfill_replay: {permissions: *cicd_owner}
+        freshness_check: {permissions: *cicd_owner}
+        gl_pipeline_scheduled: {permissions: *cicd_owner}
+        governance: {permissions: *cicd_owner}
+        governance_check: {permissions: *cicd_owner}
+        maintenance: {permissions: *cicd_owner}
+        silver_state_check: {permissions: *cicd_owner}
+        trial_balance_check: {permissions: *cicd_owner}
+        tuning_probe: {permissions: *cicd_owner}
     variables:
       env: dev
 

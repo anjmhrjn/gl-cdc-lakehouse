@@ -955,9 +955,34 @@ trying to publish the same `gl_dev` tables. So both deploy the same deployment:
 
 - The bundle state lives in `gl-cicd`'s home folder, set by `workspace.root_path`, not
   in each deployer's home.
-- `gl_engineers` and `gl-cicd` get `CAN_MANAGE` on every resource.
-- Nothing sets `run_as` in dev, so runs keep the identity that owns each resource.
-  The dev resources were first created by Anuj and still run as him.
+- `gl-cicd` owns every job and the pipeline (`IS_OWNER`), and everything runs as
+  `gl-cicd` (`run_as`), as in prod. `gl_engineers` has `CAN_MANAGE`.
+
+Ownership has to be named. Without an `IS_OWNER` in the config, the CLI makes whoever
+deploys the owner (`FixPermissions` in the CLI source). The first CI deploy then tried
+to take ownership of jobs Anuj owned, and only a workspace admin may change a job's
+owner, so it failed with 403. With `gl-cicd` named as owner, the deployer gets
+`CAN_MANAGE` instead and nothing changes hands. `IS_OWNER` is only accepted on each
+resource, not at target level, so the dev target lists every job and the pipeline,
+through one YAML anchor. A new job must be added to that list, or CI's deploy fails on
+it.
+
+A laptop deploy needs the Service Principal User role on `gl-cicd`, because it binds
+`gl-cicd` as `run_as`. Anuj holds it; it is not granted to `gl_engineers`, since anyone
+with it can run code as `gl-cicd`, which reads unmasked PII. CI deploys as `gl-cicd`
+itself and needs no role.
+
+Moving dev from Anuj to `gl-cicd` (2026-10-01):
+
+- Jobs: a laptop deploy by Anuj, as workspace admin, changed their owner.
+- Pipeline: only a metastore admin can change a pipeline's owner, and no person here
+  is one. The dev pipeline was deleted instead, which dropped its tables, and the
+  next CI deploy created it again as `gl-cicd`. The tables were rebuilt from the
+  landing files, which the deletion does not touch.
+- Governance functions: transferred to `gl_engineers`. A non-admin owner can only
+  hand a function to a group they belong to. `gl_engineers` already owns the catalogs
+  and schemas, and `gl-cicd` is a member, so the governance job can still replace
+  them.
 
 `mode: development` refuses a root path outside the deployer's own folder. So dev sets
 the parts of development mode it needs as presets: `name_prefix: "[dev] "` and
@@ -968,17 +993,19 @@ it on, so that a CI deploy and a laptop deploy cannot overlap.
 `/Workspace/Shared` was rejected for the state: every workspace user can write there,
 and so could change the code a dev job runs as its owner.
 
-The move kept every resource. The first deploy with the new root path used the local
-state, so the pipeline and all jobs were updated in place with their IDs unchanged.
+Moving the state into the shared folder kept every resource: the first deploy with the
+new root path used the local state, so the pipeline and all jobs were updated in place
+with their IDs unchanged.
 
 ### Prod runs as gl-cicd
 
 Prod is deployed only by CI, on a tag, and `run_as` makes every job and the pipeline run
 as `gl-cicd`. Prod then depends on no person's account. Because the pipeline runs as
 `gl-cicd`, it had to join `gl_pii_readers` as well as `gl_engineers` (see "The pipeline
-owner must be in gl_pii_readers and gl_engineers"). The governance functions in
-`gl_prod` will be owned by `gl-cicd`, since it is the first to run the governance job
-there.
+owner must be in gl_pii_readers and gl_engineers"). In prod `gl-cicd` creates the
+pipeline, so it owns it from the start and no ownership change is ever needed. The
+governance functions in `gl_prod` will be owned by `gl-cicd`, since it is the first to
+run the governance job there.
 
 ### Predictive optimization does routine maintenance
 
