@@ -979,10 +979,14 @@ Moving dev from Anuj to `gl-cicd` (2026-10-01):
   is one. The dev pipeline was deleted instead, which dropped its tables, and the
   next CI deploy created it again as `gl-cicd`. The tables were rebuilt from the
   landing files, which the deletion does not touch.
-- Governance functions: transferred to `gl_engineers`. A non-admin owner can only
-  hand a function to a group they belong to. `gl_engineers` already owns the catalogs
-  and schemas, and `gl-cicd` is a member, so the governance job can still replace
-  them.
+- Governance functions: transferred to `gl_engineers` first. A non-admin owner can only
+  hand a function to a group they belong to, and `gl-cicd` is a member, so it could
+  replace them. The governance job's `CREATE OR REPLACE FUNCTION` then recreated them
+  as `gl-cicd`, which now owns them, as it will in prod.
+
+After the move, a full refresh, `governance`, `governance_check` and
+`silver_state_check` all ran as `gl-cicd` and passed, with every checksum equal to the
+checkpoint 6 runs in `docs/results.md`.
 
 `mode: development` refuses a root path outside the deployer's own folder. So dev sets
 the parts of development mode it needs as presets: `name_prefix: "[dev] "` and
