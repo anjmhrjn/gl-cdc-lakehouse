@@ -27,3 +27,5 @@ resources:
       configuration:
         gl.catalog: ${var.catalog}
         gl.landing_root: ${var.landing_root}
+        gl.max_files_per_trigger: ${var.max_files_per_trigger}
+        gl.journal_target_file_size: ${var.journal_target_file_size}

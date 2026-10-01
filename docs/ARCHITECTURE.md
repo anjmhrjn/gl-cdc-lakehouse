@@ -900,3 +900,115 @@ from the two new ones), and `silver_state_check` again.
 - This rests on one assumption: the AUTO CDC flows had dropped their dedupe state just
   as the quarantine flow had. Each flow keeps its own state, but they read the same
   bronze rows in the same updates, so their watermarks move together.
+
+## Checkpoint 6: Tuning, cost, CI/CD
+
+Experiment numbers are in `docs/results.md`. This section records the decisions.
+
+### CI signs in with GitHub OIDC, as one service principal
+
+The workflows authenticate as the `gl-cicd` service principal through Databricks OAuth
+token federation (`DATABRICKS_AUTH_TYPE: github-oidc`). GitHub issues a short-lived
+token per job, and Databricks exchanges it because a federation policy on `gl-cicd`
+trusts it. So there is no Databricks secret anywhere, in GitHub or elsewhere.
+
+`databricks.yml` names a profile per target (`gl-dev`, `gl-prod`) for laptop use. With a
+profile named, CLI 1.8.0 ignores `DATABRICKS_AUTH_TYPE` from the environment, so
+environment variables alone fail in CI. Each workflow runs
+`.github/scripts/databricks-profiles.sh` first, which writes both profiles into the
+runner's `~/.databrickscfg` with `auth_type = github-oidc`. The profiles also set
+`audience` from the `DATABRICKS_TOKEN_AUDIENCE` repository variable, which must equal
+the audience in the federation policies: the `gl-cicd` application ID. The audience is
+only a value the token and the policy must agree on. The Databricks docs suggest the
+account ID; the application ID works the same, and ties tokens to this one service
+principal's policies. Without it,
+the CLI asks GitHub for a token whose audience is the workspace token endpoint (read
+from the SDK source, `determineAudience`), and the exchange would be refused.
+
+The policies trust GitHub environments, not branches:
+
+- `repo:anjmhrjn@57608084/gl-cdc-lakehouse@1396470167:environment:dev` for PR
+  validation and the deploy on merge to main
+- `repo:anjmhrjn@57608084/gl-cdc-lakehouse@1396470167:environment:prod` for the deploy
+  on a `v*` tag
+
+GitHub puts the numeric owner and repository IDs next to the names in the token
+subject for this repository, so the subject is not the `repo:<owner>/<repo>:...` form
+in the Databricks example. The IDs tie the policy to this repository: a repository
+created later under the same name would have a different ID and would not match. The
+subject a job actually sends is printed in the error when the exchange is refused.
+
+The prod environment in GitHub only accepts `v*` tags, so no branch or pull request can
+get a token through the prod policy. A branch subject (`ref:refs/heads/main`) would not
+match pull requests or tags, which have their own subjects.
+
+One service principal serves both environments, and it is in `gl_engineers`, so a dev
+token could in principle deploy prod. That is accepted for a one-person repo where only
+the owner can push branches. On a team there would be one service principal per
+environment, each granted only its own catalog.
+
+### Dev is one shared deployment
+
+A table belongs to exactly one pipeline. If CI deployed dev as `gl-cicd` into its own
+deployment while Anuj deployed from a laptop into his, there would be two dev pipelines
+trying to publish the same `gl_dev` tables. So both deploy the same deployment:
+
+- The bundle state lives in `gl-cicd`'s home folder, set by `workspace.root_path`, not
+  in each deployer's home.
+- `gl_engineers` and `gl-cicd` get `CAN_MANAGE` on every resource.
+- Nothing sets `run_as` in dev, so runs keep the identity that owns each resource.
+  The dev resources were first created by Anuj and still run as him.
+
+`mode: development` refuses a root path outside the deployer's own folder. So dev sets
+the parts of development mode it needs as presets: `name_prefix: "[dev] "` and
+`pipelines_development: true`. Schedules are paused by `schedule_pause`. Development
+mode would also have turned off the deployment lock, and the shared deployment needs
+it on, so that a CI deploy and a laptop deploy cannot overlap.
+
+`/Workspace/Shared` was rejected for the state: every workspace user can write there,
+and so could change the code a dev job runs as its owner.
+
+The move kept every resource. The first deploy with the new root path used the local
+state, so the pipeline and all jobs were updated in place with their IDs unchanged.
+
+### Prod runs as gl-cicd
+
+Prod is deployed only by CI, on a tag, and `run_as` makes every job and the pipeline run
+as `gl-cicd`. Prod then depends on no person's account. Because the pipeline runs as
+`gl-cicd`, it had to join `gl_pii_readers` as well as `gl_engineers` (see "The pipeline
+owner must be in gl_pii_readers and gl_engineers"). The governance functions in
+`gl_prod` will be owned by `gl-cicd`, since it is the first to run the governance job
+there.
+
+### Predictive optimization does routine maintenance
+
+The metastore has predictive optimization enabled, and `gl_dev` inherits it. The
+pipeline's streaming tables carry
+`spark.internal.streaming_table.predictive_optimization.enabled = true`. So OPTIMIZE and
+VACUUM already run in the background, and the `maintenance` job has no schedule. It
+runs OPTIMIZE (and VACUUM with the default 7 day retention) on demand, after a large
+backfill or for an experiment. OPTIMIZE on a pipeline's streaming table from a job was
+confirmed to work on dev. The gold materialized views are left out: every update
+recomputes them, and DESCRIBE DETAIL does not accept them.
+
+### Two experiment settings stay in the bundle
+
+`max_files_per_trigger` (Auto Loader files per micro-batch, default 1000) and
+`journal_target_file_size` (default `auto`) exist to reproduce the experiments in
+`docs/results.md`. At their defaults they change nothing: 1000 is Auto Loader's own
+default, and `auto` sets no table property.
+
+### SCD2 history, as AUTO CDC writes it
+
+The medium dataset showed two AUTO CDC behaviors that the small runs had not:
+
+- An update whose values equal the open version's opens no new version. The docs say
+  SCD type 2 creates a version "whenever any column value changes".
+- A delete right after another delete for the same key has no open version to close.
+  AUTO CDC then writes a closed row from the delete's before image, with a NULL
+  `__START_AT` and the delete's lsn as `__END_AT`. This is observed, not documented.
+
+The generator produces the second case because it can pick an already deleted account
+to delete. A real source would not, but it is kept as one more kind of messy input.
+Gold is not affected: `latest_accounts` orders versions by `__START_AT DESC`, which puts
+the NULL row last.

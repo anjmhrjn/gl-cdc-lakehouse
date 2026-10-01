@@ -1,0 +1,33 @@
+# Version tag: deploy the bundle to prod, as gl-cicd. Schedules deploy paused
+# (schedule_pause defaults to PAUSED); unpausing is a deliberate step in RUNBOOK.md.
+name: deploy-prod
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # The prod environment only accepts v* tags, so no branch or pull request can get a
+    # token through this environment's federation policy.
+    environment: prod
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      BUNDLE_VAR_alert_email: ${{ secrets.BUNDLE_VAR_ALERT_EMAIL }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: databricks/setup-cli@v1.8.0
+      - run: .github/scripts/databricks-profiles.sh
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_TOKEN_AUDIENCE: ${{ vars.DATABRICKS_TOKEN_AUDIENCE }}
+      - run: databricks bundle validate -t prod
+      - run: databricks bundle deploy -t prod

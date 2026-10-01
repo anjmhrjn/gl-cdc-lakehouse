@@ -1,0 +1,33 @@
+resources:
+  jobs:
+    tuning_probe:
+      name: tuning_probe_${var.env}
+      description: Read-only measurements for docs/results.md. Table stats, flow durations, benchmark queries, query history and cost. See src/jobs/tuning_probe.py.
+      max_concurrent_runs: 1
+      parameters:
+        - name: mode
+          default: stats
+        - name: label
+          default: unlabelled
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "5"
+      tasks:
+        - task_key: probe
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/jobs/tuning_probe.py
+            parameters:
+              - --catalog
+              - ${var.catalog}
+              - --pipeline-id
+              - ${resources.pipelines.gl_pipeline.id}
+              - --mode
+              - "{{job.parameters.mode}}"
+              - --label
+              - "{{job.parameters.label}}"
+              - --src
+              - ${workspace.file_path}/src
+              - --job-id
+              - "{{job.id}}"

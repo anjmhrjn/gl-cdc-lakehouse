@@ -188,3 +188,95 @@ both cases. A follow-up replay, run 2 hours 48 minutes after the full refresh an
 two rounds of new data, did reach AUTO CDC: the rejected reason counts rose by exactly
 the older files' rejected events. Silver and gold were unchanged, so AUTO CDC ignores
 a (key, lsn) it has already applied. The results are in ARCHITECTURE.md.
+
+## Shared dev deployment planned under development mode
+
+**Produced:** the checkpoint 6 plan, which proposed a shared `root_path` for the dev
+target so that CI (as `gl-cicd`) and Anuj's laptop deploy the same dev pipeline and
+jobs, while keeping `mode: development`.
+
+**Wrong:** development mode refuses that. It requires the root path to be under `~/`
+or to contain the deployer's user name, and the name prefix to contain the deployer's
+short name. Both exist so that two people never share one development deployment,
+which is exactly what the plan wanted.
+
+**Caught by:** `databricks bundle validate -t dev`, before anything was deployed:
+`root_path must start with '~/' or contain the current username to ensure uniqueness
+when using 'mode: development'`.
+
+**Fix:** the dev target drops `mode: development` and sets the presets it needs:
+`name_prefix: "[dev] "` and `pipelines_development: true`. Schedules were already
+paused through `schedule_pause`. The state moved to `gl-cicd`'s home folder rather
+than `/Workspace/Shared`, which validate flagged as writable by every workspace user.
+
+## SCD2 reference opened a version for every event
+
+**Produced:** `expected_scd2` in `src/transforms/cdc.py`, the reference history that
+`silver_state_check` compares `silver.account_history` against. Every non-delete event
+opened a version, and the next event closed it.
+
+**Wrong:** two cases AUTO CDC handles differently, neither of which the checkpoint 2 to
+5 runs (about 500 events) happened to contain:
+
+- An update whose values equal the open version's. AUTO CDC opens a version only when a
+  tracked column changes, so it keeps one version where the reference had two.
+- A second delete in a row for the same key. AUTO CDC writes a closed row from the
+  delete's before image with a NULL `__START_AT`. The reference wrote nothing.
+
+**Caught by:** `silver_state_check` after the first full refresh on the checkpoint 6
+medium dataset (1.1M events): `silver.account_history expected=215015 actual=214556
+missing=940 extra=481`. A one-off diagnostic printed the events and both histories for
+the differing keys. After the first fix, 14 extra rows remained, each on a key with two
+deletes in a row.
+
+**Fix:** unit tests for both cases in `tests/unit/test_scd2.py`, then the reference drops
+unchanged updates and writes the repeated delete row. The pipeline was not changed; it
+was right. After the fix, `silver_state_check` passed: 214,556 rows, 0 missing, 0 extra.
+The repeated delete behavior is observed, not documented, so the reference models only
+the case that occurred.
+
+## CI workflows authenticated only through environment variables
+
+**Produced:** the checkpoint 6 workflows set `DATABRICKS_AUTH_TYPE: github-oidc`,
+`DATABRICKS_HOST` and `DATABRICKS_CLIENT_ID` as environment variables, as in the
+Databricks GitHub Actions example. Before pushing, I had simulated CI only with a
+dummy token, which confirmed that the CLI falls back to environment variables when
+the `gl-dev` profile is missing, but not which auth type it then uses.
+
+**Wrong:** two things.
+
+- `databricks.yml` names a profile for each target. With a profile named, CLI 1.8.0
+  ignores `DATABRICKS_AUTH_TYPE` from the environment, so no auth method was chosen.
+- Even with the auth type fixed, the CLI requests the GitHub token with the workspace
+  token endpoint as audience. The federation policy lists the `gl-cicd` application
+  ID as its audience, so the exchange would have been refused next.
+
+**Caught by:** the first pull request. `validate` failed with `default auth: cannot
+configure default credentials`, and the config it printed had `profile=gl-dev` and no
+auth type. A local run with the same variables reproduced it inside the repo but not
+outside it. The audience was found in the same local runs: the failed token request
+URL ended in `audience=https://<workspace>/oidc/v1/token`. The Go SDK's
+`determineAudience` confirmed the default.
+
+**Fix:** `.github/scripts/databricks-profiles.sh` writes the `gl-dev` and `gl-prod`
+profiles on the runner with `auth_type = github-oidc`, `client_id` and `audience`, from
+repository variables. Checked locally with a fake token URL: both targets now request
+the token through `github-oidc` with the configured audience.
+
+## Federation policy subject in the wrong format
+
+**Produced:** the subjects I gave Anuj for the `gl-cicd` federation policies,
+`repo:anjmhrjn/gl-cdc-lakehouse:environment:dev` and `...:prod`, copied from the
+format in the Databricks GitHub Actions example.
+
+**Wrong:** the tokens GitHub issues for this repository carry the numeric owner and
+repository IDs in the subject:
+`repo:anjmhrjn@57608084/gl-cdc-lakehouse@1396470167:environment:dev`. An exact match
+against the name-only form fails.
+
+**Caught by:** the second run of `pr.yml`. The token exchange returned
+`TOKEN_SUBJECT_INVALID` and printed the subject the token carried.
+
+**Fix:** the policies use the subject GitHub actually sends. ARCHITECTURE.md and
+RUNBOOK.md list it, and the RUNBOOK says where the refusal message shows the real
+subject and audience.

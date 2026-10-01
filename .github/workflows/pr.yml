@@ -1,0 +1,43 @@
+# Every pull request: lint, unit tests, and bundle validation for both targets.
+name: pr
+
+on:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      # PySpark 4 needs Java 17 or later. Pinned so a runner image change cannot move it.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: astral-sh/setup-uv@v7
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run pytest tests/unit
+
+  validate:
+    runs-on: ubuntu-latest
+    # The dev environment is what the gl-cicd federation policy trusts. Validation only
+    # reads the workspace, but it still has to sign in.
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      BUNDLE_VAR_alert_email: ${{ secrets.BUNDLE_VAR_ALERT_EMAIL }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: databricks/setup-cli@v1.8.0
+      - run: .github/scripts/databricks-profiles.sh
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_TOKEN_AUDIENCE: ${{ vars.DATABRICKS_TOKEN_AUDIENCE }}
+      - run: databricks bundle validate -t dev
+      - run: databricks bundle validate -t prod

@@ -68,6 +68,74 @@ def test_duplicates_do_not_create_versions(load_events):
     assert history(events) == [("A1", "OPEN", 10, 20), ("A1", "FROZEN", 20, None)]
 
 
+def test_unchanged_update_does_not_open_a_version(load_events):
+    # A source can emit an update that changes nothing (UPDATE ... SET x = x). AUTO CDC
+    # opens a new version only when a tracked column changes, so the first version
+    # stays open until the real change at lsn 30.
+    events = load_events(
+        "accounts",
+        [
+            event("r", 10, after=account("A1")),
+            event("u", 20, after=account("A1")),
+            event("u", 30, after=account("A1", status="FROZEN")),
+        ],
+    )
+    assert history(events) == [("A1", "OPEN", 10, 30), ("A1", "FROZEN", 30, None)]
+
+
+def test_unchanged_updates_in_a_row_collapse(load_events):
+    events = load_events(
+        "accounts",
+        [
+            event("r", 10, after=account("A1")),
+            event("u", 20, after=account("A1")),
+            event("u", 25, after=account("A1")),
+        ],
+    )
+    assert history(events) == [("A1", "OPEN", 10, None)]
+
+
+def test_same_values_after_a_delete_open_a_version(load_events):
+    # The delete closed the version, so identical values re-insert the key.
+    events = load_events(
+        "accounts",
+        [
+            event("r", 10, after=account("A1")),
+            event("d", 20, before=account("A1")),
+            event("u", 30, after=account("A1")),
+        ],
+    )
+    assert history(events) == [("A1", "OPEN", 10, 20), ("A1", "OPEN", 30, None)]
+
+
+def test_second_delete_in_a_row_writes_a_closed_row_with_no_start(load_events):
+    # Observed on dev, not documented: a delete that finds no open version makes AUTO
+    # CDC write a history row from the delete's before image, with a NULL __START_AT
+    # and the delete's lsn as __END_AT.
+    events = load_events(
+        "accounts",
+        [
+            event("r", 10, after=account("A1")),
+            event("d", 20, before=account("A1")),
+            event("d", 30, before=account("A1", status="FROZEN")),
+        ],
+    )
+    assert history(events) == [("A1", "FROZEN", None, 30), ("A1", "OPEN", 10, 20)]
+
+
+def test_late_unchanged_update_is_absorbed(load_events):
+    # Arrives last but sequences between 10 and 30, with the values already open at 10.
+    events = load_events(
+        "accounts",
+        [
+            event("r", 10, after=account("A1")),
+            event("u", 30, after=account("A1", status="FROZEN")),
+            event("u", 20, after=account("A1")),
+        ],
+    )
+    assert history(events) == [("A1", "OPEN", 10, 30), ("A1", "FROZEN", 30, None)]
+
+
 def test_keys_are_independent(load_events):
     events = load_events(
         "accounts",

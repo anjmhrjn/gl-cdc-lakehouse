@@ -167,3 +167,69 @@ the pipeline task twice, a minute apart, before it fails.
 3. A data problem does not fail the pipeline. Bad rows are dropped or quarantined, and
    the counts are in the event log. So a failure is either a code or schema change, or
    infrastructure: storage credential, KMS key, or permissions.
+
+## Deploying
+
+Deploys go through CI. Nobody deploys prod from a laptop.
+
+| Event | Workflow | What it does |
+|---|---|---|
+| pull request | `pr.yml` | ruff, unit tests, `bundle validate` for dev and prod |
+| merge to main | `deploy-dev.yml` | `bundle deploy -t dev` |
+| tag `v*` | `deploy-prod.yml` | `bundle validate -t prod`, `bundle deploy -t prod` |
+
+A deploy starts no compute. Schedules stay paused unless `schedule_pause` is set to
+`UNPAUSED`.
+
+### Release to prod
+
+1. Merge to main and check that `deploy-dev` passed.
+2. Tag the commit and push the tag:
+
+   ```
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+
+3. Check that `deploy-prod` passed in the GitHub Actions tab.
+4. On the first release only, run the pipeline and then governance, because the
+   governance job needs the tables to exist:
+
+   ```
+   databricks bundle run gl_pipeline -t prod
+   databricks bundle run governance -t prod
+   databricks bundle run governance_check -t prod
+   ```
+
+### A deploy failed
+
+- **`cannot configure default credentials`:** the profiles step did not run or a
+  repository variable is empty. It needs `DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID` and
+  `DATABRICKS_TOKEN_AUDIENCE`.
+- **Token exchange refused** (401 or 403 from `github-oidc`): the token does not match
+  the federation policy. The policy subject must match the job's environment exactly
+  (`repo:anjmhrjn@57608084/gl-cdc-lakehouse@1396470167:environment:dev` or
+  `...:prod`), and the policy audience must equal `DATABRICKS_TOKEN_AUDIENCE`. The
+  refusal message prints the subject and audience the token carried, under "Valid
+  federation policy for provided token".
+- **Deployment lock held:** another deploy of the same target is running, or one
+  crashed. Wait for it. If it crashed, deploy once with `--force-lock` from a laptop.
+- **Validation error:** fix it in a pull request. `pr.yml` runs the same validation.
+
+A failed deploy can leave some resources updated and some not. Deploy again from the
+same commit, or from the previous tag to go back.
+
+### Laptop deploys to dev
+
+Dev is one deployment shared by CI and laptops (see ARCHITECTURE.md). A laptop deploy
+of a branch replaces what main put there until the next merge.
+
+## Maintenance
+
+Predictive optimization runs OPTIMIZE and VACUUM in the background. To compact at once,
+for example after a large backfill:
+
+```
+databricks bundle run maintenance -t dev
+databricks bundle run maintenance -t dev --params tables=silver.journal_entries,vacuum=false
+```
