@@ -2,8 +2,8 @@
 
 Tuning experiments and cost, measured on dev. Each experiment says what changed, the
 before and after numbers, and why the result came out the way it did. The numbers come
-from the `tuning_probe` and `maintenance` jobs (`src/jobs/`), so every figure here can be
-produced again with the commands shown.
+from the `tuning_probe` and `maintenance` jobs (`src/jobs/`) and from the system table
+queries in `sql/analysis/`, so every figure here can be produced again.
 
 ## Dataset
 
@@ -147,7 +147,8 @@ day is 2026-09-30):
 | hot_account_day | account_id = hot AND entry_date = day | 102,407 |
 | one_day | entry_date = day | 328,849 |
 
-Files and bytes read, from `system.query.history` (`tuning_probe mode=history`). Bytes
+Files and bytes read, from `system.query.history` (`sql/analysis/benchmark_history.sql`,
+run by hand; at the time it was a `tuning_probe` mode, removed since, see Cost). Bytes
 are what the query read after column pruning, so they are well under the table size.
 
 | Query | D: files read | D: bytes | E: files read | E: files skipped | E: bytes | Bytes, E / D |
@@ -222,14 +223,16 @@ another table of lines keyed on account. Then salting the hot key would be the f
 
 ## Cost
 
-The cost query is `tuning_probe mode=cost`: DBUs per pipeline update
-(`usage_metadata.dlt_update_id`) and per job run, from `system.billing.usage`, priced
-with `system.billing.list_prices` at `pricing.effective_list.default`. These are list
-prices, not what the account is invoiced.
+The cost query is `sql/analysis/cost_per_update.sql`: DBUs per pipeline update
+(`usage_metadata.dlt_update_id`) from `system.billing.usage`, priced with
+`system.billing.list_prices` at `pricing.effective_list.default`. These are list prices,
+not what the account is invoiced.
 
-```
-databricks bundle run tuning_probe -t dev --params mode=cost
-```
+It is run by a person in the SQL editor or a notebook, not by a job. Jobs run as
+`gl-cicd`, and the system tables (billing, query history) are kept readable by people
+only: billing covers the whole account, and the CI identity has no need for it. During
+the experiments the query was a `tuning_probe` mode, which worked while jobs ran as
+Anuj and failed with `INSUFFICIENT_PERMISSIONS` once they ran as `gl-cicd`.
 
 Billing records arrive hours after the usage. When this was written the newest record
 was from 16:50 UTC, so the experiment runs (21:03 to 22:01 UTC) were not in yet.
@@ -270,10 +273,9 @@ The same pipeline also billed 1.685 DBUs (0.590 USD) from 21:00 UTC with no upda
 and no maintenance id. It is real cost of running the pipeline, but billing does not
 say what it was for.
 
-The cost query in `tuning_probe mode=cost` filters by the bundle's current pipeline id.
 These runs belong to the dev pipeline that was deleted on 2026-10-01 when `gl-cicd`
-took ownership, so they were read with the same query and that pipeline's old id
-(`75bb9baf-ffe1-49e4-8869-28c924a7057e`).
+took ownership, so they are found with that pipeline's old id
+(`75bb9baf-ffe1-49e4-8869-28c924a7057e`) as `:pipeline_id`.
 
 The first prod update (44944bdb-f3f8-493e-97bf-49ceae69574d, 2026-10-01 15:19 UTC) was
 not in billing yet when this was written.

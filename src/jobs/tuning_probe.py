@@ -1,9 +1,7 @@
-"""Measurements for the tuning experiments and the cost figures in docs/results.md.
+"""Measurements for the tuning experiments in docs/results.md.
 
   databricks bundle run tuning_probe -t dev --params mode=stats
   databricks bundle run tuning_probe -t dev --params mode=queries,label=baseline
-  databricks bundle run tuning_probe -t dev --params mode=history
-  databricks bundle run tuning_probe -t dev --params mode=cost
   databricks bundle run tuning_probe -t dev --params mode=skew
 
 Modes:
@@ -11,19 +9,16 @@ Modes:
            in the most recent pipeline updates (event log). DESCRIBE DETAIL rejects
            the gold materialized views as views, so they are left out.
   queries  runs the benchmark queries over silver.journal_entries and prints the label
-           with each result
-  history  bytes and files read, files pruned and duration of every benchmark query
-           this job has run, from system.query.history. Records can take up to an hour
-           to appear there.
-  cost     DBUs and list price per pipeline update and per job run, from
-           system.billing.usage joined to system.billing.list_prices
+           with each result. Files and bytes they read are in system.query.history;
+           see sql/analysis/benchmark_history.sql.
   skew     times the gold join of journal lines to accounts three ways: forced
            shuffle (sort-merge), Spark's own choice, and forced broadcast. The hot
            account holds ~30% of lines, so a shuffle join sends ~30% of the rows to one
            task.
 
-It only reads, so it can run as often as needed. It runs as the job owner, who must be
-able to read the event log and the system tables.
+It only reads, so it can run as often as needed. It runs as gl-cicd, which owns the
+pipeline and so can read its event log. Query history and billing are system tables,
+which only people can read, so those queries live in sql/analysis/ and are run by hand.
 """
 
 import argparse
@@ -41,6 +36,7 @@ TABLES = (
 
 UPDATES_SHOWN = 5
 
+# The order matters: sql/analysis/benchmark_history.sql names the queries by position.
 BENCHMARKS = ("cold_account_day", "cold_account", "hot_account_day", "one_day")
 
 
@@ -119,81 +115,9 @@ def queries(spark, catalog: str, label: str) -> None:
     assert list(benchmarks) == list(BENCHMARKS)
     for name, where in benchmarks.items():
         sql = f"SELECT count(*) AS n, sum(amount) AS total FROM {je} WHERE {where}"
-        # history mode finds these by this exact source line; see its docstring.
+        # sql/analysis/benchmark_history.sql finds these by this exact source line.
         row = spark.sql(sql).first()
         print(f"{label} {name}: rows={row['n']} total={row['total']}")
-
-
-def history(spark, job_id: str) -> None:
-    """Files and bytes read by each benchmark query, one row per query per run.
-
-    For a serverless Python job, query history stores the Python source line that ran
-    the query, not the SQL. So the benchmark queries are found by this job's id and the
-    line `row = spark.sql(sql).first()`, and named by their order within the run.
-    """
-    names = ", ".join(f"{i + 1}, '{name}'" for i, name in enumerate(BENCHMARKS))
-    show(
-        spark.sql(
-            f"""
-            SELECT min(start_time) OVER (PARTITION BY query_source.job_info.job_run_id)
-                     AS run_started,
-                   element_at(map({names}), row_number() OVER (
-                     PARTITION BY query_source.job_info.job_run_id ORDER BY start_time
-                   )) AS query,
-                   read_bytes, read_files, pruned_files, total_duration_ms
-            FROM system.query.history
-            WHERE query_source.job_info.job_id = '{job_id}'
-              AND statement_text LIKE '%row = spark.sql(sql).first()%'
-              AND start_time >= current_timestamp() - INTERVAL 7 DAYS
-            ORDER BY run_started, query
-            """
-        ),
-        500,
-    )
-
-
-def cost(spark, pipeline_id: str) -> None:
-    priced = """
-        SELECT u.*, u.usage_quantity * p.pricing.effective_list.default AS list_usd
-        FROM system.billing.usage u
-        JOIN system.billing.list_prices p
-          ON u.sku_name = p.sku_name
-         AND u.cloud = p.cloud
-         AND u.usage_unit = p.usage_unit
-         AND u.usage_end_time >= p.price_start_time
-         AND (p.price_end_time IS NULL OR u.usage_end_time < p.price_end_time)
-        WHERE u.usage_date >= current_date() - INTERVAL 14 DAYS
-    """
-    show(
-        spark.sql(
-            f"""
-            SELECT usage_metadata.dlt_update_id AS update_id,
-                   min(usage_start_time) AS first_usage,
-                   round(sum(usage_quantity), 3) AS dbus,
-                   round(sum(list_usd), 3) AS list_usd
-            FROM ({priced})
-            WHERE usage_metadata.dlt_pipeline_id = '{pipeline_id}'
-            GROUP BY ALL
-            ORDER BY first_usage DESC
-            """
-        ),
-        50,
-    )
-    show(
-        spark.sql(
-            f"""
-            SELECT usage_metadata.job_id, usage_metadata.job_run_id,
-                   min(usage_start_time) AS first_usage,
-                   round(sum(usage_quantity), 3) AS dbus,
-                   round(sum(list_usd), 3) AS list_usd
-            FROM ({priced})
-            WHERE usage_metadata.job_id IS NOT NULL
-            GROUP BY ALL
-            ORDER BY first_usage DESC
-            """
-        ),
-        50,
-    )
 
 
 SKEW_REPEATS = 3
@@ -233,12 +157,9 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--catalog", required=True)
     p.add_argument("--pipeline-id", required=True)
-    p.add_argument(
-        "--mode", required=True, choices=["stats", "queries", "history", "cost", "skew"]
-    )
+    p.add_argument("--mode", required=True, choices=["stats", "queries", "skew"])
     p.add_argument("--label", default="unlabelled")
     p.add_argument("--src", required=True, help="workspace path of src/, for transforms")
-    p.add_argument("--job-id", required=True, help="this job's id, for history mode")
     args = p.parse_args()
 
     from pyspark.sql import SparkSession
@@ -248,12 +169,8 @@ def main() -> None:
         stats(spark, args.catalog, args.pipeline_id)
     elif args.mode == "queries":
         queries(spark, args.catalog, args.label)
-    elif args.mode == "history":
-        history(spark, args.job_id)
-    elif args.mode == "skew":
-        skew(spark, args.catalog, args.src)
     else:
-        cost(spark, args.pipeline_id)
+        skew(spark, args.catalog, args.src)
 
 
 if __name__ == "__main__":

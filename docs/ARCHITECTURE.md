@@ -1022,6 +1022,15 @@ backfill or for an experiment. OPTIMIZE on a pipeline's streaming table from a j
 confirmed to work on dev. The gold materialized views are left out: every update
 recomputes them, and DESCRIBE DETAIL does not accept them.
 
+### System tables are read by people, not by jobs
+
+Billing and query history (`system.billing`, `system.query`) are readable by Anuj only.
+Every dev and prod job runs as `gl-cicd`, which is not granted them: billing covers the
+whole account, and nothing the CI identity runs needs it. The two system table queries
+the experiments used are SQL files in `sql/analysis/`, run by hand in the SQL editor or
+a notebook. The `tuning_probe` job keeps only what `gl-cicd` can read: table details,
+the pipeline's event log (it owns the pipeline), and the benchmark and skew queries.
+
 ### Two experiment settings stay in the bundle
 
 `max_files_per_trigger` (Auto Loader files per micro-batch, default 1000) and
