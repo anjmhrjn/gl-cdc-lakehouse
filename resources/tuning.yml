@@ -2,7 +2,7 @@ resources:
   jobs:
     tuning_probe:
       name: tuning_probe_${var.env}
-      description: Read-only measurements for docs/results.md. Table stats, flow durations, benchmark queries, query history and cost. See src/jobs/tuning_probe.py.
+      description: Read-only measurements for docs/results.md. Table stats, flow durations, benchmark queries and the skew test. See src/jobs/tuning_probe.py.
       max_concurrent_runs: 1
       parameters:
         - name: mode
@@ -29,5 +29,3 @@ resources:
               - "{{job.parameters.label}}"
               - --src
               - ${workspace.file_path}/src
-              - --job-id
-              - "{{job.id}}"

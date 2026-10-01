@@ -193,7 +193,8 @@ A deploy starts no compute. Schedules stay paused unless `schedule_pause` is set
 
 3. Check that `deploy-prod` passed in the GitHub Actions tab.
 4. On the first release only, run the pipeline and then governance, because the
-   governance job needs the tables to exist:
+   governance job needs the tables to exist. Everything runs as `gl-cicd`. Running a
+   prod job from a laptop needs permission to run it; Anuj has it as workspace admin:
 
    ```
    databricks bundle run gl_pipeline -t prod

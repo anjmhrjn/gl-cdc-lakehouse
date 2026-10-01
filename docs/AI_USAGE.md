@@ -301,3 +301,19 @@ more permissions, each found from a refused call: the Service Principal User rol
 Anuj's laptop deploy, metastore admin to change a pipeline owner (so the dev pipeline
 was deleted and recreated by CI instead), and group-only transfers for function
 ownership (so the functions went to `gl_engineers`).
+
+## Prod root path depended on who ran the command
+
+**Produced:** the prod target's `root_path` as
+`/Workspace/Users/${workspace.current_user.userName}/.bundle/...`, kept from before prod
+moved to CI.
+
+**Wrong:** CI deploys prod as `gl-cicd`, so the state is in its home. On a laptop the
+same setting resolves to the laptop user's home, where there is no state, so
+`bundle run -t prod` could not find the jobs CI had deployed.
+
+**Caught by:** planning the first prod run, before any command failed. The prod run
+used `pipelines start-update` and `jobs run-now` with the IDs instead.
+
+**Fix:** prod's `root_path` names `gl-cicd`'s home. For CI that is the same path, so
+nothing moved; `bundle summary -t prod` from a laptop now lists the prod resources.
