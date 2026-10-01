@@ -146,9 +146,9 @@ function's schema. `column_masks` has `column_name` and `mask_name`. `row_filter
 ones.
 
 **Fix:** the queries use the column names from the workspace. The function names are
-compared whether they come back bare, schema qualified or fully qualified, because it
-is not yet known which form the views return. On a mismatch the check prints the actual
-value.
+compared whether they come back bare, schema qualified or fully qualified, so the check
+does not depend on which form the views return. Which form they actually return was not
+recorded. On a mismatch the check prints the actual value.
 
 **Second failure, same check:** after the column fix, the check failed on 7 tables it
 was never meant to see. It required a classification tag on every table in silver and
@@ -174,8 +174,8 @@ does with a (key, lsn) it has already applied.
 **Wrong:** I treated the one hour watermark as wall-clock time. It advances with the
 `_ingested_at` of new data. In the dev run the originals had been ingested less than an
 hour before the newest data, so the dedupe still held their state and dropped the
-copies. The copies never reached AUTO CDC, and the question the run was meant to
-answer is still open.
+copies. The copies never reached AUTO CDC, and that run did not answer the question it
+was meant to answer.
 
 **Caught by:** the quarantine reason counts in `silver_state_check`, pasted back by
 Anuj. After the replay `unparseable_payload` went from 1 to 2, while `amount_positive`
