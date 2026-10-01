@@ -222,7 +222,14 @@ same commit, or from the previous tag to go back.
 ### Laptop deploys to dev
 
 Dev is one deployment shared by CI and laptops (see ARCHITECTURE.md). A laptop deploy
-of a branch replaces what main put there until the next merge.
+of a branch replaces what main put there until the next merge. It needs the Service
+Principal User role on `gl-cicd`, because everything in dev runs as `gl-cicd`.
+
+### Adding a job
+
+Add the job's key to the dev target's `resources.jobs` list in `databricks.yml`, with
+`{permissions: *cicd_owner}`. Without it the first deploy makes the deployer the job's
+owner, and the next deploy by anyone else fails with `403 PERMISSION_DENIED`.
 
 ## Maintenance
 

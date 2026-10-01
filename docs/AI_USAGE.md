@@ -280,3 +280,24 @@ against the name-only form fails.
 **Fix:** the policies use the subject GitHub actually sends. ARCHITECTURE.md and
 RUNBOOK.md list it, and the RUNBOOK says where the refusal message shows the real
 subject and audience.
+
+## Shared dev deployment left job ownership to whoever deployed
+
+**Produced:** the checkpoint 6 dev target: one deployment shared by CI and laptops,
+with `CAN_MANAGE` for `gl_engineers` and `gl-cicd` and no `run_as`. I expected each
+resource to keep its first owner, Anuj, and to keep running as him.
+
+**Wrong:** on every deploy the CLI makes the deploying identity `IS_OWNER` of each job
+and pipeline, unless the config names an owner. My own deploys during the experiments
+ran as Anuj, so nothing changed hands and the problem stayed hidden.
+
+**Caught by:** the first `deploy-dev` run after the merge: `cannot update
+resources.jobs.governance.permissions ... only workspace admins can change the owner of
+a job (403 PERMISSION_DENIED)`. `FixPermissions` in the CLI v1.8.0 source showed why.
+
+**Fix:** with Anuj's choice, `gl-cicd` owns and runs dev as in prod. The dev target
+names `gl-cicd` as `IS_OWNER` on every resource and sets `run_as`. The move needed three
+more permissions, each found from a refused call: the Service Principal User role for
+Anuj's laptop deploy, metastore admin to change a pipeline owner (so the dev pipeline
+was deleted and recreated by CI instead), and group-only transfers for function
+ownership (so the functions went to `gl_engineers`).
