@@ -97,7 +97,9 @@ targets:
     mode: production
     workspace:
       profile: gl-prod
-      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+      # gl-cicd's home, as CI resolves it, named outright so that a laptop's
+      # `bundle run -t prod` or `bundle summary -t prod` finds the same state.
+      root_path: /Workspace/Users/${var.cicd_sp}/.bundle/${bundle.name}/${bundle.target}
     run_as:
       service_principal_name: ${var.cicd_sp}
     variables:

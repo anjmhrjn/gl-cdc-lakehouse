@@ -1043,3 +1043,37 @@ The generator produces the second case because it can pick an already deleted ac
 to delete. A real source would not, but it is kept as one more kind of messy input.
 Gold is not affected: `latest_accounts` orders versions by `__START_AT DESC`, which puts
 the NULL row last.
+
+### Prod root path names gl-cicd's home
+
+Prod's `root_path` was `/Workspace/Users/${workspace.current_user.userName}/...`. CI
+deploys as `gl-cicd`, so the state landed in its home, but a laptop resolved the same
+setting to the laptop user's home, found no state, and `bundle run -t prod` could not
+find the deployed jobs. The path now names `gl-cicd`'s home directly. For CI that is
+the same path as before, so the deployment did not move.
+
+### Verified on prod
+
+Run on 2026-10-01. Anuj applied `envs/prod.tfvars` (12 added), wrote a small prod batch
+(`--env prod --minutes 10 --rate 50`) and pushed tag `v0.1.0`; `deploy-prod` passed. Then,
+as `gl-cicd`:
+
+| Step | Result |
+|---|---|
+| first `gl_pipeline_prod` update | completed, no errors or warnings |
+| `governance` | applied |
+| `governance_check` | 8 classifications, 11 masks with pii tags, 4 row filters, no `ALL PRIVILEGES` |
+| `trial_balance_check` | pass: 0 unexplained groups, 0 stale orphans |
+| `silver_state_check` | every table matches, 0 missing, 0 extra |
+
+| Table | Rows |
+|---|---|
+| silver.accounts | 203 |
+| silver.account_history | 279 |
+| silver.journal_entries | 408 |
+| silver.quarantine_events | 4 |
+| gold.account_balances | 145 |
+| gold.daily_trial_balance | 32 |
+
+So the same commit runs in dev and prod with only `env` changed, through CI, with no
+person's account involved in prod. Schedules stay paused; unpausing is a RUNBOOK step.

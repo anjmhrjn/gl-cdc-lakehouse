@@ -250,15 +250,33 @@ does not group by, so that is the likely source but it has not been checked.
 
 Job runs on serverless (state checks, governance, replay) cost 0.003 to 0.184 USD each.
 
-**Checkpoint 6 experiment updates:** PENDING until billing delivers them. Update ids:
+**Checkpoint 6 experiment updates**, full refreshes over the medium dataset (1.1M
+events), all on SKU `PREMIUM_JOBS_SERVERLESS_COMPUTE_US_EAST_OHIO`:
 
-| Run | Update id |
-|---|---|
-| A: defaults, one batch | 5dbe95ba-b549-4f00-b882-751c21f34196 |
-| B: 30 files per batch | cb5f41dc-31e5-4972-9639-e58897fac346 |
-| D: 1 MB files, not clustered | 4f4b1b91-c979-495d-a4a0-f0bc0a85e034 |
-| E: 1 MB files, clustered | 6f0985b5-b14a-458c-8f8f-89c88b9e0826 |
-| final: defaults, clustered | 6ad5c574-ec03-46e3-9eb4-4dceb3051bb5 |
+| Run | Update id | DBUs | List USD |
+|---|---|---|---|
+| A: defaults, one batch | 5dbe95ba-b549-4f00-b882-751c21f34196 | 0.511 | 0.179 |
+| B: 30 files per batch | cb5f41dc-31e5-4972-9639-e58897fac346 | 0.529 | 0.185 |
+| D: 1 MB files, not clustered | 4f4b1b91-c979-495d-a4a0-f0bc0a85e034 | 0.516 | 0.181 |
+| E: 1 MB files, clustered | 6f0985b5-b14a-458c-8f8f-89c88b9e0826 | 0.350 | 0.122 |
+| final: defaults, clustered | 6ad5c574-ec03-46e3-9eb4-4dceb3051bb5 | 0.359 | 0.126 |
+
+A full refresh of a day of data costs 0.12 to 0.19 USD at list price. Cost follows
+update duration (E and the final run were also the shortest), so the same caution
+applies: E and final were back to back and may have reused warm compute. The 48
+batches of run B cost 3% more than one batch, the same as the duration.
+
+The same pipeline also billed 1.685 DBUs (0.590 USD) from 21:00 UTC with no update id
+and no maintenance id. It is real cost of running the pipeline, but billing does not
+say what it was for.
+
+The cost query in `tuning_probe mode=cost` filters by the bundle's current pipeline id.
+These runs belong to the dev pipeline that was deleted on 2026-10-01 when `gl-cicd`
+took ownership, so they were read with the same query and that pipeline's old id
+(`75bb9baf-ffe1-49e4-8869-28c924a7057e`).
+
+The first prod update (44944bdb-f3f8-493e-97bf-49ceae69574d, 2026-10-01 15:19 UTC) was
+not in billing yet when this was written.
 
 **What an unpaused prod would cost:** the schedule makes 48 pipeline updates a day. At
 the checkpoint 2 to 5 figure of about 0.10 USD each that is about 4.80 USD a day, before
